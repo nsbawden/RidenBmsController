@@ -1,0 +1,71 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="512"
+    android:viewportHeight="512">
+
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,0h512v512h-512z" />
+
+    <!-- Triangle sun rays, bases tucked into the sun arc so there are no gaps. -->
+    <path
+        android:fillColor="#FFB300"
+        android:pathData="M256,56 L294,184 L218,184 Z" />
+    <path
+        android:fillColor="#FFB300"
+        android:pathData="M138,92 L222,200 L152,226 Z" />
+    <path
+        android:fillColor="#FFB300"
+        android:pathData="M374,92 L360,226 L290,200 Z" />
+    <path
+        android:fillColor="#FFB300"
+        android:pathData="M50,184 L182,242 L126,300 Z" />
+    <path
+        android:fillColor="#FFB300"
+        android:pathData="M462,184 L386,300 L330,242 Z" />
+
+    <!-- Large half sun body. -->
+    <path
+        android:fillColor="#FFC107"
+        android:pathData="M42,386 A214,214 0,0 1,470 386 L42,386 Z" />
+    <path
+        android:fillColor="#FFE082"
+        android:fillAlpha="0.82"
+        android:pathData="M82,386 A174,174 0,0 1,430 386 L82,386 Z" />
+
+    <!-- Dashboard-like SOC arc, about 70% charged. -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#735100"
+        android:strokeWidth="24"
+        android:strokeLineCap="round"
+        android:pathData="M122,366 A134,134 0,0 1,390 366" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#35D07F"
+        android:strokeWidth="24"
+        android:strokeLineCap="round"
+        android:pathData="M122,366 A134,134 0,0 1,314 246" />
+
+    <!-- Battery symbol inside the sun, lower than the SOC arc. -->
+    <path
+        android:fillColor="#0D1622"
+        android:pathData="M184,308 H318 Q331,308 331,321 V359 Q331,372 318,372 H184 Q171,372 171,359 V321 Q171,308 184,308 Z" />
+    <path
+        android:fillColor="#0D1622"
+        android:pathData="M335,328 H352 Q359,328 359,335 V345 Q359,352 352,352 H335 Z" />
+    <path
+        android:fillColor="#173224"
+        android:pathData="M186,322 H308 Q315,322 315,329 V351 Q315,358 308,358 H186 Z" />
+    <path
+        android:fillColor="#35D07F"
+        android:pathData="M186,322 H274 V358 H186 Z" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#B9FFD8"
+        android:strokeAlpha="0.45"
+        android:strokeWidth="7"
+        android:strokeLineCap="round"
+        android:pathData="M201,334 H260" />
+</vector>
