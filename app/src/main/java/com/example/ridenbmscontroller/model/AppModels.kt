@@ -62,6 +62,13 @@ data class ControllerState(
     val socTargetPercent: Int
 )
 
+data class AlertState(
+    val usbAlarmActive: Boolean,
+    val lowSocAlarmActive: Boolean,
+    val lowSocSilenced: Boolean,
+    val lowSocThresholdPercent: Int
+)
+
 data class AppSettings(
     val maxBatteryVolts: Double,
     val balanceEveryDays: Int,
@@ -71,6 +78,8 @@ data class AppSettings(
     val controllerEnabled: Boolean,
     val normalSocCeilingPercent: Int,
     val socHoldCurrentAmps: Double,
+    val bmsCurrentDeadbandAmps: Double,
+    val lowSocAlarmPercent: Int,
     val kneeTrackingDelaySeconds: Double,
     val keepScreenOn: Boolean
 )
@@ -94,8 +103,10 @@ data class AppState(
     val riden: RidenState,
     val energy: EnergyCounters,
     val controller: ControllerState,
+    val alerts: AlertState,
     val settings: AppSettings,
     val history: List<HistoryPoint>,
+    val events: List<String>,
     val logs: List<String>
 ) {
     companion object {
@@ -144,6 +155,12 @@ data class AppState(
                 recoveryActive = false,
                 socTargetPercent = 100
             ),
+            alerts = AlertState(
+                usbAlarmActive = false,
+                lowSocAlarmActive = false,
+                lowSocSilenced = false,
+                lowSocThresholdPercent = 20
+            ),
             settings = AppSettings(
                 maxBatteryVolts = 14.20,
                 balanceEveryDays = 7,
@@ -153,10 +170,13 @@ data class AppState(
                 controllerEnabled = false,
                 normalSocCeilingPercent = 100,
                 socHoldCurrentAmps = 0.5,
+                bmsCurrentDeadbandAmps = 1.0,
+                lowSocAlarmPercent = 20,
                 kneeTrackingDelaySeconds = 12.0,
                 keepScreenOn = true
             ),
             history = emptyList(),
+            events = emptyList(),
             logs = emptyList()
         )
     }

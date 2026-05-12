@@ -16,6 +16,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -50,7 +51,11 @@ import kotlin.math.cos
 import kotlin.math.sin
 
 @Composable
-fun DashboardScreen(state: AppState, modifier: Modifier = Modifier) {
+fun DashboardScreen(
+    state: AppState,
+    onSilenceLowSocAlarm: () -> Unit = {},
+    modifier: Modifier = Modifier
+) {
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -59,14 +64,14 @@ fun DashboardScreen(state: AppState, modifier: Modifier = Modifier) {
             .padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        BatteryGaugeCard(state)
+        BatteryGaugeCard(state, onSilenceLowSocAlarm)
         RidenPanel(state)
         ControllerPanel(state)
     }
 }
 
 @Composable
-private fun BatteryGaugeCard(state: AppState) {
+private fun BatteryGaugeCard(state: AppState, onSilenceLowSocAlarm: () -> Unit) {
     Surface(
         color = Panel,
         shape = RoundedCornerShape(8.dp),
@@ -77,6 +82,10 @@ private fun BatteryGaugeCard(state: AppState) {
             modifier = Modifier.padding(14.dp)
         ) {
             HalfCircleSocGauge(state)
+            if (state.alerts.lowSocAlarmActive) {
+                Spacer(Modifier.height(8.dp))
+                LowSocAlertRow(state, onSilenceLowSocAlarm)
+            }
             Spacer(Modifier.height(10.dp))
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -94,13 +103,15 @@ private fun BatteryGaugeCard(state: AppState) {
 @Composable
 private fun HalfCircleSocGauge(state: AppState) {
     val soc = state.battery.socPercent.coerceIn(0, 100)
+    val lowSocActive = state.alerts.lowSocAlarmActive
+    val gaugeColor = if (lowSocActive) WarningOrange else BatteryGreen
     val chargeText = when (state.battery.direction) {
         PowerDirection.Charging -> "CHARGING"
         PowerDirection.Discharging -> "DISCHARGING"
         PowerDirection.Idle -> "IDLE"
     }
     val chargeColor = when (state.battery.direction) {
-        PowerDirection.Charging -> BatteryGreen
+        PowerDirection.Charging -> if (lowSocActive) WarningOrange else BatteryGreen
         PowerDirection.Discharging -> VoltageAmber
         PowerDirection.Idle -> TextMuted
     }
@@ -120,20 +131,24 @@ private fun HalfCircleSocGauge(state: AppState) {
             val left = (width - gaugeWidth) / 2f
             val top = 28.dp.toPx()
             val rect = Rect(left, top, left + gaugeWidth, top + arcHeight * 2f)
-            val progressSweep = 180f * (soc / 100f)
+            val arcRadius = rect.width / 2f
+            val capAngle = Math.toDegrees((stroke / 2f / arcRadius).toDouble()).toFloat()
+            val gaugeStart = 180f + capAngle
+            val gaugeSweep = 180f - capAngle * 2f
+            val progressSweep = gaugeSweep * (soc / 100f)
 
             drawArc(
                 color = PanelAlt,
-                startAngle = 180f,
-                sweepAngle = 180f,
+                startAngle = gaugeStart,
+                sweepAngle = gaugeSweep,
                 useCenter = false,
                 topLeft = Offset(rect.left, rect.top),
                 size = Size(rect.width, rect.height),
                 style = Stroke(width = stroke, cap = StrokeCap.Round)
             )
             drawArc(
-                color = BatteryGreen,
-                startAngle = 180f,
+                color = gaugeColor,
+                startAngle = gaugeStart,
                 sweepAngle = progressSweep,
                 useCenter = false,
                 topLeft = Offset(rect.left, rect.top),
@@ -168,7 +183,7 @@ private fun HalfCircleSocGauge(state: AppState) {
         ) {
             Text(
                 text = "$soc%",
-                color = MaterialTheme.colorScheme.onSurface,
+                color = if (lowSocActive) WarningOrange else MaterialTheme.colorScheme.onSurface,
                 fontSize = 48.sp,
                 fontWeight = FontWeight.Bold
             )
@@ -210,6 +225,37 @@ private fun HalfCircleSocGauge(state: AppState) {
                     fontSize = 11.sp,
                     fontWeight = FontWeight.SemiBold
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LowSocAlertRow(state: AppState, onSilenceLowSocAlarm: () -> Unit) {
+    Surface(
+        color = WarningOrange.copy(alpha = 0.16f),
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(8.dp)
+        ) {
+            Text(
+                text = if (state.alerts.lowSocSilenced) {
+                    "LOW SOC ${state.battery.socPercent}% - silenced"
+                } else {
+                    "LOW SOC ${state.battery.socPercent}%"
+                },
+                color = WarningOrange,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f)
+            )
+            if (!state.alerts.lowSocSilenced) {
+                Button(onClick = onSilenceLowSocAlarm) {
+                    Text("Silence")
+                }
             }
         }
     }

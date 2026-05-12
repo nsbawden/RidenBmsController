@@ -2,6 +2,8 @@ package com.example.ridenbmscontroller
 
 import android.os.Bundle
 import android.content.Context
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.SystemClock
 import android.view.WindowManager
 import androidx.activity.result.contract.ActivityResultContracts
@@ -22,9 +24,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.Bluetooth
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Settings
 import com.example.ridenbmscontroller.ble.BmsBleDevice
@@ -34,6 +36,7 @@ import com.example.ridenbmscontroller.controller.MpptControlState
 import com.example.ridenbmscontroller.controller.SolarMpptController
 import com.example.ridenbmscontroller.model.AppState
 import com.example.ridenbmscontroller.model.AppSettings
+import com.example.ridenbmscontroller.model.AlertState
 import com.example.ridenbmscontroller.model.BatteryState
 import com.example.ridenbmscontroller.model.ChargeMode
 import com.example.ridenbmscontroller.model.ControllerState
@@ -46,11 +49,17 @@ import com.example.ridenbmscontroller.riden.RidenUsbState
 import com.example.ridenbmscontroller.ui.screens.DashboardScreen
 import com.example.ridenbmscontroller.ui.screens.DevicesScreen
 import com.example.ridenbmscontroller.ui.screens.HistoryScreen
-import com.example.ridenbmscontroller.ui.screens.LogsScreen
 import com.example.ridenbmscontroller.ui.screens.SettingsScreen
+import com.example.ridenbmscontroller.ui.screens.ToolsScreen
 import com.example.ridenbmscontroller.ui.theme.RidenBmsTheme
 import java.io.File
+import java.text.SimpleDateFormat
 import java.util.Calendar
+import java.util.Locale
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private lateinit var bmsBleScanner: BmsBleScanner
@@ -68,9 +77,16 @@ class MainActivity : ComponentActivity() {
     private var lastEnergyWatts: Double? = null
     private var lastBmsEnergyWatts: Double? = null
     private var historyPoints by mutableStateOf(emptyList<HistoryPoint>())
+    private var controllerEvents by mutableStateOf(emptyList<String>())
+    private var alertState by mutableStateOf(AppState.preview.alerts)
+    private var lastControllerEventSignature = ""
     private var lastHistorySampleMs = 0L
     private var lastHistoryPruneMs = 0L
     private var historyAccumulator = HistoryAccumulator()
+    private var hadGoodRidenConnection = false
+    private var usbAlarmJob: Job? = null
+    private var lowSocAlarmJob: Job? = null
+    private var lowSocSilenced = false
 
     private val requestBlePermissions = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -93,13 +109,14 @@ class MainActivity : ComponentActivity() {
             setVset = { ridenUsbMonitor.setVset(it) },
             setIset = { ridenUsbMonitor.setIset(it) },
             onBalanceDayStarted = { markBalanceDayStarted(it) },
-            onState = { mpptControlState = it }
+            onState = { handleMpptControlState(it) }
         )
         bmsBleScanner = BmsBleScanner(this) {
             bmsBleState = it
             historyAccumulator.addBms(it)
             updateBmsEnergyFromPower(it.telemetry.packVoltage, it.telemetry.packCurrent)
             maybeRecordHistory()
+            updateLowSocAlarm()
             tickController()
         }
         ridenUsbMonitor = RidenUsbMonitor(this, lifecycleScope) {
@@ -107,6 +124,7 @@ class MainActivity : ComponentActivity() {
             historyAccumulator.addRiden(it)
             updateEnergyFromPower(it.telemetry.watts)
             maybeRecordHistory()
+            updateUsbAlarm(it.connected)
             tickController()
         }
         bmsBleScanner.refresh()
@@ -120,11 +138,14 @@ class MainActivity : ComponentActivity() {
                     mpptControlState = mpptControlState,
                     energyCounters = energyCounters,
                     historyPoints = historyPoints,
+                    controllerEvents = controllerEvents,
+                    alertState = alertState,
                     onSettingsChanged = {
                         appSettings = it
                         saveSettings(it)
                         applyKeepScreenOn(it.keepScreenOn)
                         applyControllerKeepAlive(it.controllerEnabled)
+                        updateLowSocAlarm()
                         tickController()
                     },
                     onRequestBlePermissions = {
@@ -137,7 +158,8 @@ class MainActivity : ComponentActivity() {
                     balanceDayToday = isBalanceDayToday(appSettings),
                     daysUntilNextBalance = daysUntilNextBalance(appSettings),
                     onToggleBalanceToday = { toggleBalanceToday() },
-                    onResetEnergyTotal = { resetEnergyTotal() }
+                    onResetEnergyTotal = { resetEnergyTotal() },
+                    onSilenceLowSocAlarm = { silenceLowSocAlarm() }
                 )
             }
         }
@@ -146,6 +168,159 @@ class MainActivity : ComponentActivity() {
     private fun tickController() {
         if (!::mpptController.isInitialized) return
         mpptController.tick(appSettings, bmsBleState, ridenUsbState)
+    }
+
+    private fun updateUsbAlarm(connected: Boolean) {
+        if (connected) {
+            if (!hadGoodRidenConnection) addControllerEvent("Riden USB connected")
+            hadGoodRidenConnection = true
+            stopUsbAlarm()
+            publishAlerts()
+            return
+        }
+        if (hadGoodRidenConnection) {
+            if (usbAlarmJob == null) addControllerEvent("Riden USB disconnected")
+            startUsbAlarmIfNeeded()
+        }
+        publishAlerts()
+    }
+
+    private fun startUsbAlarmIfNeeded() {
+        if (usbAlarmJob != null) return
+        usbAlarmJob = lifecycleScope.launch {
+            val tone = try {
+                ToneGenerator(AudioManager.STREAM_ALARM, 100)
+            } catch (_: Exception) {
+                null
+            }
+            try {
+                while (isActive) {
+                    repeat(3) {
+                        try {
+                            tone?.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 250)
+                        } catch (_: Exception) {
+                        }
+                        delay(350)
+                    }
+                    delay(3000)
+                }
+            } finally {
+                try {
+                    tone?.release()
+                } catch (_: Exception) {
+                }
+            }
+        }
+    }
+
+    private fun stopUsbAlarm() {
+        usbAlarmJob?.cancel()
+        usbAlarmJob = null
+    }
+
+    private fun updateLowSocAlarm() {
+        val soc = bmsBleState.telemetry.socPercent
+        val active = bmsBleState.connectedDeviceAddress != null &&
+            soc != null &&
+            soc <= appSettings.lowSocAlarmPercent
+
+        if (!active) {
+            if (lowSocAlarmJob != null || lowSocSilenced) addControllerEvent("Low SOC alarm cleared")
+            lowSocSilenced = false
+            stopLowSocAlarm()
+            publishAlerts()
+            return
+        }
+
+        if (!lowSocSilenced) {
+            if (lowSocAlarmJob == null) addControllerEvent("Low SOC alarm: $soc%")
+            startLowSocAlarmIfNeeded()
+        } else {
+            stopLowSocAlarm()
+        }
+        publishAlerts()
+    }
+
+    private fun startLowSocAlarmIfNeeded() {
+        if (lowSocAlarmJob != null) return
+        lowSocAlarmJob = lifecycleScope.launch {
+            val tone = try {
+                ToneGenerator(AudioManager.STREAM_ALARM, 80)
+            } catch (_: Exception) {
+                null
+            }
+            try {
+                while (isActive) {
+                    try {
+                        tone?.startTone(ToneGenerator.TONE_CDMA_HIGH_L, 500)
+                    } catch (_: Exception) {
+                    }
+                    delay(6000)
+                }
+            } finally {
+                try {
+                    tone?.release()
+                } catch (_: Exception) {
+                }
+            }
+        }
+    }
+
+    private fun stopLowSocAlarm() {
+        lowSocAlarmJob?.cancel()
+        lowSocAlarmJob = null
+    }
+
+    private fun silenceLowSocAlarm() {
+        if (!alertState.lowSocAlarmActive) return
+        lowSocSilenced = true
+        stopLowSocAlarm()
+        addControllerEvent("Low SOC alarm silenced")
+        publishAlerts()
+    }
+
+    private fun publishAlerts() {
+        val soc = bmsBleState.telemetry.socPercent
+        val lowSocActive = bmsBleState.connectedDeviceAddress != null &&
+            soc != null &&
+            soc <= appSettings.lowSocAlarmPercent
+        alertState = AlertState(
+            usbAlarmActive = usbAlarmJob != null,
+            lowSocAlarmActive = lowSocActive,
+            lowSocSilenced = lowSocActive && lowSocSilenced,
+            lowSocThresholdPercent = appSettings.lowSocAlarmPercent
+        )
+    }
+
+    private fun handleMpptControlState(state: MpptControlState) {
+        val previous = mpptControlState
+        mpptControlState = state
+
+        val signature = listOf(
+            state.enabled,
+            state.pvMode,
+            state.status,
+            "%.1f".format(state.targetChargeCurrent),
+            "%.1f".format(state.commandIset),
+            state.recoveryActive,
+            state.socTargetPercent
+        ).joinToString("|")
+        if (signature == lastControllerEventSignature) return
+        lastControllerEventSignature = signature
+
+        val important = previous.enabled != state.enabled ||
+            previous.pvMode != state.pvMode ||
+            previous.status != state.status ||
+            previous.recoveryActive != state.recoveryActive ||
+            previous.socTargetPercent != state.socTargetPercent
+        if (!important) return
+
+        addControllerEvent("${state.pvMode}: ${state.status}")
+    }
+
+    private fun addControllerEvent(text: String) {
+        val event = "${eventTimeFormat.format(System.currentTimeMillis())}  $text"
+        controllerEvents = (listOf(event) + controllerEvents).take(MAX_CONTROLLER_EVENTS)
     }
 
     private fun applyKeepScreenOn(enabled: Boolean) {
@@ -186,6 +361,11 @@ class MainActivity : ComponentActivity() {
                 KEY_SOC_HOLD_CURRENT_A,
                 prefs.getFloat(KEY_MAX_SOC_TRICKLE_A, defaults.socHoldCurrentAmps.toFloat())
             ).toDouble(),
+            bmsCurrentDeadbandAmps = prefs.getFloat(
+                KEY_BMS_CURRENT_DEADBAND_A,
+                defaults.bmsCurrentDeadbandAmps.toFloat()
+            ).toDouble(),
+            lowSocAlarmPercent = prefs.getInt(KEY_LOW_SOC_ALARM_PERCENT, defaults.lowSocAlarmPercent),
             kneeTrackingDelaySeconds = prefs.getFloat(
                 KEY_KNEE_TRACKING_DELAY_S,
                 prefs.getFloat(KEY_HCC_QUIET_S, defaults.kneeTrackingDelaySeconds.toFloat())
@@ -205,6 +385,8 @@ class MainActivity : ComponentActivity() {
             .putBoolean(KEY_CONTROLLER_ENABLED, settings.controllerEnabled)
             .putInt(KEY_NORMAL_SOC_CEILING_PERCENT, settings.normalSocCeilingPercent)
             .putFloat(KEY_SOC_HOLD_CURRENT_A, settings.socHoldCurrentAmps.toFloat())
+            .putFloat(KEY_BMS_CURRENT_DEADBAND_A, settings.bmsCurrentDeadbandAmps.toFloat())
+            .putInt(KEY_LOW_SOC_ALARM_PERCENT, settings.lowSocAlarmPercent)
             .putFloat(KEY_KNEE_TRACKING_DELAY_S, settings.kneeTrackingDelaySeconds.toFloat())
             .putBoolean(KEY_KEEP_SCREEN_ON, settings.keepScreenOn)
             .apply()
@@ -218,8 +400,10 @@ class MainActivity : ComponentActivity() {
 
     private fun toggleBalanceToday() {
         val today = currentEpochDay()
-        val epochDay = if (isBalanceDayToday(appSettings)) today - 1L else today
+        val wasBalanceDay = isBalanceDayToday(appSettings)
+        val epochDay = if (wasBalanceDay) today - 1L else today
         markBalanceDayStarted(epochDay)
+        addControllerEvent(if (wasBalanceDay) "Balance day canceled" else "Balance day forced")
         tickController()
     }
 
@@ -462,6 +646,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        stopUsbAlarm()
+        stopLowSocAlarm()
         bmsBleScanner.stopScan()
         ridenUsbMonitor.stop()
         persistEnergy()
@@ -483,6 +669,8 @@ class MainActivity : ComponentActivity() {
         private const val KEY_MAX_SOC_TRICKLE_A = "max_soc_trickle_a"
         private const val KEY_NORMAL_SOC_CEILING_PERCENT = "normal_soc_ceiling_percent"
         private const val KEY_SOC_HOLD_CURRENT_A = "soc_hold_current_a"
+        private const val KEY_BMS_CURRENT_DEADBAND_A = "bms_current_deadband_a"
+        private const val KEY_LOW_SOC_ALARM_PERCENT = "low_soc_alarm_percent"
         private const val KEY_HCC_QUIET_S = "hcc_quiet_s"
         private const val KEY_KNEE_TRACKING_DELAY_S = "knee_tracking_delay_s"
         private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
@@ -499,6 +687,8 @@ class MainActivity : ComponentActivity() {
         private const val HISTORY_SAMPLE_MS = 30_000L
         private const val HISTORY_KEEP_DAYS = 30
         private const val HISTORY_PRUNE_MS = 300_000L
+        private const val MAX_CONTROLLER_EVENTS = 80
+        private val eventTimeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
     }
 }
 
@@ -577,7 +767,7 @@ private enum class AppTab(
     History("History", Icons.Filled.BarChart),
     Devices("Devices", Icons.Filled.Bluetooth),
     Settings("Settings", Icons.Filled.Settings),
-    Logs("Logs", Icons.AutoMirrored.Filled.List)
+    Tools("Tools", Icons.Filled.Build)
 }
 
 @Composable
@@ -588,6 +778,8 @@ private fun RidenBmsApp(
     mpptControlState: MpptControlState,
     energyCounters: EnergyCounters,
     historyPoints: List<HistoryPoint>,
+    controllerEvents: List<String>,
+    alertState: AlertState,
     onSettingsChanged: (AppSettings) -> Unit,
     onRequestBlePermissions: () -> Unit,
     onStartBmsScan: () -> Unit,
@@ -597,10 +789,26 @@ private fun RidenBmsApp(
     balanceDayToday: Boolean,
     daysUntilNextBalance: Int,
     onToggleBalanceToday: () -> Unit,
-    onResetEnergyTotal: () -> Unit
+    onResetEnergyTotal: () -> Unit,
+    onSilenceLowSocAlarm: () -> Unit
 ) {
-    val state = remember(bmsBleState, ridenUsbState, appSettings, mpptControlState, energyCounters, historyPoints) {
-        AppState.preview.copy(settings = appSettings, energy = energyCounters, history = historyPoints)
+    val state = remember(
+        bmsBleState,
+        ridenUsbState,
+        appSettings,
+        mpptControlState,
+        energyCounters,
+        historyPoints,
+        controllerEvents,
+        alertState
+    ) {
+        AppState.preview.copy(
+            settings = appSettings,
+            energy = energyCounters,
+            history = historyPoints,
+            events = controllerEvents,
+            alerts = alertState
+        )
             .withBmsTelemetry(bmsBleState)
             .withRidenTelemetry(ridenUsbState)
             .withMpptControl(mpptControlState)
@@ -622,7 +830,11 @@ private fun RidenBmsApp(
         }
     ) { innerPadding ->
         when (selectedTab) {
-            AppTab.Dashboard -> DashboardScreen(state, Modifier.padding(innerPadding))
+            AppTab.Dashboard -> DashboardScreen(
+                state = state,
+                onSilenceLowSocAlarm = onSilenceLowSocAlarm,
+                modifier = Modifier.padding(innerPadding)
+            )
             AppTab.History -> HistoryScreen(state, Modifier.padding(innerPadding))
             AppTab.Devices -> DevicesScreen(
                 bleState = bmsBleState,
@@ -645,7 +857,7 @@ private fun RidenBmsApp(
                 onResetEnergyTotal = onResetEnergyTotal,
                 modifier = Modifier.padding(innerPadding)
             )
-            AppTab.Logs -> LogsScreen(state, Modifier.padding(innerPadding))
+            AppTab.Tools -> ToolsScreen(state, Modifier.padding(innerPadding))
         }
     }
 }
@@ -699,6 +911,8 @@ private fun AppState.withRidenTelemetry(usbState: RidenUsbState): AppState {
                 telemetry.vin?.let { add("Riden VIN: %.2f V".format(it)) }
                 telemetry.vout?.let { add("Riden VOUT: %.2f V".format(it)) }
                 telemetry.iout?.let { add("Riden IOUT: %.2f A".format(it)) }
+                telemetry.vset?.let { add("Riden VSET: %.2f V".format(it)) }
+                telemetry.iset?.let { add("Riden ISET: %.2f A".format(it)) }
             }
         }
     )

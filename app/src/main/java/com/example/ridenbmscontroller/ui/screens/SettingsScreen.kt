@@ -70,6 +70,12 @@ fun SettingsScreen(
             NumberFieldRow("SOC hold current", settings.socHoldCurrentAmps, "A", 0.0, 5.0) {
                 onSettingsChanged(settings.copy(socHoldCurrentAmps = it))
             }
+            NumberFieldRow("BMS current deadband", settings.bmsCurrentDeadbandAmps, "A", 0.0, 5.0) {
+                onSettingsChanged(settings.copy(bmsCurrentDeadbandAmps = it))
+            }
+            IntFieldRow("Low SOC alarm", settings.lowSocAlarmPercent, "%", 0, 100) {
+                onSettingsChanged(settings.copy(lowSocAlarmPercent = it))
+            }
             IntFieldRow("Balance interval", settings.balanceEveryDays, "days", 1, 60) {
                 onSettingsChanged(settings.copy(balanceEveryDays = it))
             }
