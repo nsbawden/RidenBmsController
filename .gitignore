@@ -1,5 +1,6 @@
 *.iml
-.gradle
+.gradle/
+.kotlin/
 /local.properties
 /.idea/caches
 /.idea/libraries
@@ -16,8 +17,15 @@ local.properties
 
 # Generated build output
 **/build/
+*.apk
+*.ap_
+*.aab
 
 
 # JVM crash dumps
 *.hprof
+
+# Local signing material
+*.jks
+*.keystore
 
