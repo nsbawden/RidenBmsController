@@ -19,7 +19,9 @@ data class MpptControlState(
     val vinErrorVolts: Double = 0.0,
     val policyLimitAmps: Double = 0.0,
     val recoveryPhase: String = "--",
+    val recoveryCycleCount: Int = 0,
     val controlBand: String = "--",
+    val controlStepAmps: Double = 0.0,
     val chargeVoltageTarget: Double = 0.0,
     val recoveryActive: Boolean = false,
     val socTargetPercent: Int = 0
@@ -53,6 +55,8 @@ class SolarMpptController(
     private var lastWorkingIset = Tuning.MIN_ISET
     private var lastCollapseMs = 0L
     private var recentCollapseCount = 0
+    private var recoveryCycleCount = 0
+    private var stableSinceMs = 0L
     private var alarmWasActive = false
     private var alarmHoldUntilMs = 0L
     private var alarmBackoffMs = Tuning.ALARM_BASE_HOLD_MS
@@ -133,6 +137,7 @@ class SolarMpptController(
             socPercent >= socTarget || voltageLimited -> {
                 pvMode = if (balanceDay) MODE_BALANCE else if (socPercent >= socTarget) MODE_SOC_HOLD else MODE_VOLTAGE_LIMIT
                 recoveryPhase = PHASE_NONE
+                updateStableRecoveryReset(false, settings, vin, virtualKnee, now)
                 adjustForBatteryCurrent(oldIset, batteryAmps, policyLimit).coerceAtMost(policyLimit)
             }
             else -> trackSolarKnee(settings, oldIset, vin, virtualKnee, now)
@@ -147,6 +152,7 @@ class SolarMpptController(
             status = statusFor(balanceDay, socPercent >= socTarget, voltageLimited),
             policyLimit = policyLimit,
             band = bandFor(finalVinError),
+            stepAmps = stepFor(finalVinError),
             vinError = finalVinError,
             socTargetPercent = socTarget
         )
@@ -176,6 +182,7 @@ class SolarMpptController(
         if (vin >= virtualKnee - Tuning.RECOVERY_STABLE_ERR_V) {
             lastWorkingIset = max(lastWorkingIset * 0.8 + oldIset * 0.2, Tuning.MIN_ISET)
         }
+        updateStableRecoveryReset(true, settings, vin, virtualKnee, now)
 
         // Periodically try a lower virtual knee. If that asks too much of the panels,
         // collapse recovery will raise the knee back up.
@@ -199,6 +206,8 @@ class SolarMpptController(
         lastWorkingIset = max(oldIset, commandIset).coerceAtLeast(Tuning.MIN_ISET)
         recoveryPhase = PHASE_WAIT_VIN
         pvMode = MODE_RECOVER
+        recoveryCycleCount += 1
+        stableSinceMs = 0L
         raiseKneeForCollapse(settings)
         return if (isCollapsed(settings, vin)) {
             Tuning.MIN_ISET
@@ -214,6 +223,7 @@ class SolarMpptController(
         virtualKnee: Double
     ): Double {
         pvMode = MODE_RECOVER
+        stableSinceMs = 0L
 
         if (isCollapsed(settings, vin)) {
             if (recoveryPhase != PHASE_WAIT_VIN) {
@@ -261,6 +271,14 @@ class SolarMpptController(
     }
 
     private fun huntStep(absErr: Double): Double {
+        return stepForAbsError(absErr)
+    }
+
+    private fun stepFor(vinError: Double): Double {
+        return if (pvMode == MODE_RECOVER) 0.0 else stepForAbsError(abs(vinError))
+    }
+
+    private fun stepForAbsError(absErr: Double): Double {
         return when {
             absErr > Tuning.V4 -> Tuning.HUGE_STEP_A
             absErr > Tuning.V3 -> Tuning.FAR_STEP_A
@@ -300,6 +318,38 @@ class SolarMpptController(
         return (settings.kneeTrackingDelaySeconds * 750.0).toLong().coerceIn(2_000L, 10_000L)
     }
 
+    private fun updateStableRecoveryReset(
+        tracking: Boolean,
+        settings: AppSettings,
+        vin: Double,
+        virtualKnee: Double,
+        now: Long
+    ) {
+        if (recoveryCycleCount == 0) return
+
+        val stable = tracking &&
+            vin >= recoveryExitFloor(settings) &&
+            abs(vin - virtualKnee) <= Tuning.RECOVERY_STABLE_ERR_V
+
+        if (!stable) {
+            stableSinceMs = 0L
+            return
+        }
+
+        if (stableSinceMs == 0L) stableSinceMs = now
+        if (now - stableSinceMs >= stableRecoveryResetMs(settings)) {
+            recoveryCycleCount = 0
+            recentCollapseCount = 0
+            stableSinceMs = 0L
+        }
+    }
+
+    private fun stableRecoveryResetMs(settings: AppSettings): Long {
+        // "Stable" for UI counting means the charger has returned to ordinary tracking
+        // near the learned knee for at least one repeated-collapse window.
+        return repeatedCollapseWindowMs(settings)
+    }
+
     private fun statusFor(balanceDay: Boolean, socReached: Boolean, voltageLimited: Boolean): String {
         return when {
             pvMode == MODE_RECOVER -> "Solar recovery: $recoveryPhase"
@@ -332,6 +382,9 @@ class SolarMpptController(
         }
         commandIset = 0.0
         recoveryPhase = PHASE_NONE
+        recoveryCycleCount = 0
+        recentCollapseCount = 0
+        stableSinceMs = 0L
         pvMode = MODE_IDLE
         publish(settings, status, 0.0, "--")
     }
@@ -343,6 +396,7 @@ class SolarMpptController(
         }
         commandIset = 0.0
         recoveryPhase = PHASE_NONE
+        stableSinceMs = 0L
         pvMode = MODE_ALARM
         publish(settings, status, 0.0, "--", socTargetPercent = socTargetPercent)
     }
@@ -385,10 +439,10 @@ class SolarMpptController(
         val absErr = abs(vinError)
         return when {
             pvMode == MODE_RECOVER -> "RE"
-            absErr > 1.50 -> "HU"
-            absErr > 1.00 -> "FA"
-            absErr > 0.50 -> "MD"
-            absErr > 0.25 -> "NE"
+            absErr > Tuning.V4 -> "HU"
+            absErr > Tuning.V3 -> "FA"
+            absErr > Tuning.V2 -> "MD"
+            absErr > Tuning.V1 -> "NE"
             else -> "FI"
         }
     }
@@ -398,6 +452,7 @@ class SolarMpptController(
         status: String,
         policyLimit: Double,
         band: String,
+        stepAmps: Double = 0.0,
         vinError: Double = 0.0,
         socTargetPercent: Int = settings.normalSocCeilingPercent
     ) {
@@ -414,7 +469,9 @@ class SolarMpptController(
                 vinErrorVolts = vinError,
                 policyLimitAmps = policyLimit,
                 recoveryPhase = recoveryPhase,
+                recoveryCycleCount = recoveryCycleCount,
                 controlBand = band,
+                controlStepAmps = stepAmps,
                 chargeVoltageTarget = lastVset,
                 recoveryActive = pvMode == MODE_RECOVER,
                 socTargetPercent = socTargetPercent
@@ -457,9 +514,9 @@ private object Tuning {
     const val FAR_STEP_A = 0.30 // ISET change when VIN error is between V3 and V4.
     const val HUGE_STEP_A = 1.00 // ISET change when VIN error is larger than V4.
     const val V1 = 0.25 // Fine/near VIN error boundary in volts.
-    const val V2 = 0.50 // Near/mid VIN error boundary in volts.
-    const val V3 = 1.00 // Mid/far VIN error boundary in volts.
-    const val V4 = 1.50 // Far/huge VIN error boundary in volts.
+    const val V2 = 0.75 // Near/mid VIN error boundary in volts.
+    const val V3 = 1.50 // Mid/far VIN error boundary in volts.
+    const val V4 = 2.00 // Far/huge VIN error boundary in volts.
     const val TRACK_DEADBAND_V = 0.05 // VIN error small enough to leave ISET unchanged this tick.
 
     const val COLLAPSE_FLOOR_EXTRA_MARGIN_V = 2.0 // Collapse below target PV minus knee variance minus this cushion.

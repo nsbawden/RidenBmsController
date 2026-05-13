@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -87,8 +88,17 @@ private fun EventsTool(state: AppState) {
         if (state.events.isEmpty()) {
             Text("No controller events yet.", color = TextMuted)
         } else {
-            state.events.forEach {
-                Text(it, color = TextMuted, fontFamily = FontFamily.Monospace, fontSize = 13.sp)
+            Column(Modifier.horizontalScroll(rememberScrollState())) {
+                state.events.forEach {
+                    Text(
+                        text = it,
+                        color = TextMuted,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 13.sp,
+                        maxLines = 1,
+                        softWrap = false
+                    )
+                }
             }
         }
     }

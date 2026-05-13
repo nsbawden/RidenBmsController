@@ -7,6 +7,7 @@ import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.ScanCallback
@@ -20,6 +21,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import androidx.core.content.ContextCompat
+import androidx.core.content.edit
 import java.util.UUID
 
 class BmsBleScanner(
@@ -44,9 +46,33 @@ class BmsBleScanner(
     private var telemetry = BmsDecodedTelemetry()
     private var autoConnectAddress: String? = prefs.getString(PREF_BMS_ADDRESS, null)
     private var scanning = false
+    private var scanForAutoConnect = false
+    private var autoConnectRetriesRemaining = 0
+    private var userDisconnectRequested = false
     private var status = "Ready"
 
-    private val scanTimeoutRunnable = Runnable { stopScan("Scan complete") }
+    private val scanTimeoutRunnable = Runnable {
+        val wasAutoConnect = scanForAutoConnect
+        stopScan("Scan complete")
+        if (wasAutoConnect && connectedDeviceAddress == null && !connecting) {
+            scheduleAutoConnectRetry("BMS not found")
+        }
+    }
+    private val autoConnectRetryRunnable = Runnable {
+        if (hasPermissions() && autoConnectAddress != null && connectedDeviceAddress == null && !connecting && !scanning) {
+            startScan(autoConnect = true)
+        }
+    }
+    private val connectTimeoutRunnable = Runnable {
+        if (connecting) {
+            connecting = false
+            connectedDeviceName = null
+            connectedDeviceAddress = null
+            closeGatt()
+            publish("BMS connect timed out")
+            scheduleAutoConnectRetry("Connect timed out")
+        }
+    }
     private val pollRunnable = object : Runnable {
         override fun run() {
             if (connectedDeviceAddress != null && writeCharacteristic != null) {
@@ -79,8 +105,13 @@ class BmsBleScanner(
         }
 
         override fun onScanFailed(errorCode: Int) {
+            val wasAutoConnect = scanForAutoConnect
             scanning = false
+            scanForAutoConnect = false
             publish("Scan failed: code $errorCode")
+            if (wasAutoConnect) {
+                scheduleAutoConnectRetry("Scan failed: code $errorCode")
+            }
         }
     }
 
@@ -90,19 +121,25 @@ class BmsBleScanner(
                 when (newState) {
                     BluetoothProfile.STATE_CONNECTED -> {
                         connecting = false
+                        autoConnectRetriesRemaining = 0
+                        handler.removeCallbacks(connectTimeoutRunnable)
                         publish("Connected, discovering services...")
-                        runCatching { gatt.discoverServices() }
-                            .onFailure { publish("Service discovery failed: ${it.message ?: it.javaClass.simpleName}") }
+                        discoverServices(gatt)
                     }
 
                     BluetoothProfile.STATE_DISCONNECTED -> {
+                        val shouldRetry = !userDisconnectRequested && autoConnectAddress != null
                         connecting = false
                         connectedDeviceName = null
                         connectedDeviceAddress = null
                         gattServices = emptyList()
+                        handler.removeCallbacks(connectTimeoutRunnable)
                         stopPolling()
                         publish(if (status == BluetoothGatt.GATT_SUCCESS) "Disconnected" else "Disconnected: GATT $status")
                         closeGatt()
+                        if (shouldRetry) {
+                            scheduleAutoConnectRetry(if (status == BluetoothGatt.GATT_SUCCESS) "Disconnected" else "GATT $status")
+                        }
                     }
                 }
             }
@@ -134,13 +171,15 @@ class BmsBleScanner(
         }
 
         @Deprecated("Android framework still calls this overload on older API levels")
+        @Suppress("DEPRECATION")
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
             handler.post {
-                recordPacket("RX ${characteristic.uuid}: ${characteristic.value.toHexString()}")
-                acceptJbdBytes(characteristic.value)
+                val value = characteristic.value
+                recordPacket("RX ${characteristic.uuid}: ${value.toHexString()}")
+                acceptJbdBytes(value)
             }
         }
 
@@ -159,14 +198,19 @@ class BmsBleScanner(
     fun refresh() {
         publish(status)
         if (hasPermissions() && autoConnectAddress != null && connectedDeviceAddress == null && !connecting && !scanning) {
-            startScan()
+            beginAutoConnectRetries()
         }
     }
 
-    @SuppressLint("MissingPermission")
     fun startScan() {
+        startScan(autoConnect = false)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startScan(autoConnect: Boolean) {
         if (!hasPermissions()) {
             scanning = false
+            scanForAutoConnect = false
             publish("Bluetooth permission needed")
             return
         }
@@ -174,16 +218,19 @@ class BmsBleScanner(
         val adapter = bluetoothManager?.adapter
         if (adapter == null) {
             scanning = false
+            scanForAutoConnect = false
             publish("Bluetooth LE not supported")
             return
         }
         if (!adapter.isEnabled) {
             scanning = false
+            scanForAutoConnect = false
             publish("Bluetooth is off")
             return
         }
         if (!isLocationEnabled()) {
             scanning = false
+            scanForAutoConnect = false
             publish("Phone Location must be on for BLE scanning")
             return
         }
@@ -191,13 +238,16 @@ class BmsBleScanner(
         val scanner = adapter.bluetoothLeScanner
         if (scanner == null) {
             scanning = false
+            scanForAutoConnect = false
             publish("BLE scanner unavailable")
             return
         }
 
+        userDisconnectRequested = false
         devicesByAddress.clear()
         scanning = true
-        publish("Scanning for BMS...")
+        scanForAutoConnect = autoConnect
+        publish(if (autoConnect) "Scanning for remembered BMS..." else "Scanning for BMS...")
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .setReportDelay(0L)
@@ -220,14 +270,17 @@ class BmsBleScanner(
             return
         }
 
+        userDisconnectRequested = false
+        handler.removeCallbacks(autoConnectRetryRunnable)
         stopScan("Connecting to ${device.name}")
         closeGatt()
         if (remember) {
             autoConnectAddress = device.address
-            prefs.edit()
-                .putString(PREF_BMS_ADDRESS, device.address)
-                .putString(PREF_BMS_NAME, device.name)
-                .apply()
+            autoConnectRetriesRemaining = AUTO_CONNECT_RETRIES
+            prefs.edit {
+                putString(PREF_BMS_ADDRESS, device.address)
+                putString(PREF_BMS_NAME, device.name)
+            }
         }
         connecting = true
         connectedDeviceName = device.name
@@ -240,6 +293,8 @@ class BmsBleScanner(
         writeCharacteristic = null
         stopPolling()
         publish("Connecting to ${device.name}...")
+        handler.removeCallbacks(connectTimeoutRunnable)
+        handler.postDelayed(connectTimeoutRunnable, CONNECT_TIMEOUT_MS)
 
         runCatching {
             adapter.getRemoteDevice(device.address)
@@ -247,16 +302,22 @@ class BmsBleScanner(
         }.onSuccess {
             gatt = it
         }.onFailure {
+            handler.removeCallbacks(connectTimeoutRunnable)
             connecting = false
             connectedDeviceName = null
             connectedDeviceAddress = null
             publish("Connect failed: ${it.message ?: it.javaClass.simpleName}")
+            scheduleAutoConnectRetry("Connect failed")
         }
     }
 
     fun disconnect() {
+        userDisconnectRequested = true
+        autoConnectRetriesRemaining = 0
+        handler.removeCallbacks(autoConnectRetryRunnable)
+        handler.removeCallbacks(connectTimeoutRunnable)
         publish("Disconnecting...")
-        gatt?.disconnect()
+        disconnectGatt()
         closeGatt()
         connecting = false
         connectedDeviceName = null
@@ -298,6 +359,7 @@ class BmsBleScanner(
         }
         handler.removeCallbacks(scanTimeoutRunnable)
         scanning = false
+        scanForAutoConnect = false
         publish(doneStatus)
     }
 
@@ -346,9 +408,10 @@ class BmsBleScanner(
     }
 
     private fun readDeviceName(result: ScanResult): String {
-        return result.scanRecord?.deviceName
-            ?: runCatching { result.device.name }.getOrNull()
-            ?: ""
+        val advertisedName = result.scanRecord?.deviceName
+        if (!advertisedName.isNullOrBlank()) return advertisedName
+        if (!hasPermissions()) return ""
+        return readDeviceNameWithPermission(result).orEmpty()
     }
 
     private fun isLocationEnabled(): Boolean {
@@ -367,6 +430,47 @@ class BmsBleScanner(
         gatt = null
     }
 
+    @SuppressLint("MissingPermission")
+    private fun discoverServices(gatt: BluetoothGatt) {
+        if (!hasPermissions()) {
+            publish("Bluetooth permission needed")
+            closeGatt()
+            return
+        }
+        runCatching { gatt.discoverServices() }
+            .onFailure { publish("Service discovery failed: ${it.message ?: it.javaClass.simpleName}") }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun disconnectGatt() {
+        if (hasPermissions()) {
+            runCatching { gatt?.disconnect() }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun readDeviceNameWithPermission(result: ScanResult): String? {
+        return runCatching { result.device.name }.getOrNull()
+    }
+
+    private fun beginAutoConnectRetries() {
+        autoConnectRetriesRemaining = AUTO_CONNECT_RETRIES
+        startScan(autoConnect = true)
+    }
+
+    private fun scheduleAutoConnectRetry(reason: String) {
+        if (userDisconnectRequested || autoConnectAddress == null || connectedDeviceAddress != null || connecting) return
+        if (autoConnectRetriesRemaining <= 0) {
+            publish("$reason; BMS auto-connect gave up")
+            return
+        }
+        val attempt = AUTO_CONNECT_RETRIES - autoConnectRetriesRemaining + 1
+        autoConnectRetriesRemaining -= 1
+        publish("$reason; retrying BMS auto-connect ($attempt/$AUTO_CONNECT_RETRIES)")
+        handler.removeCallbacks(autoConnectRetryRunnable)
+        handler.postDelayed(autoConnectRetryRunnable, AUTO_CONNECT_RETRY_DELAY_MS)
+    }
+
     private fun startPolling() {
         stopPolling()
         handler.postDelayed(pollRunnable, 500L)
@@ -382,11 +486,10 @@ class BmsBleScanner(
         val characteristic = notifyCharacteristic ?: return
         if (!hasPermissions()) return
 
-        val enabled = gatt.setCharacteristicNotification(characteristic, true)
+        val enabled = runCatching { gatt.setCharacteristicNotification(characteristic, true) }.getOrDefault(false)
         val descriptor = characteristic.getDescriptor(CCCD_UUID)
         if (enabled && descriptor != null) {
-            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            gatt.writeDescriptor(descriptor)
+            writeCccdDescriptor(gatt, descriptor)
             recordPacket("Notifications enabled on ${characteristic.uuid}")
         } else {
             recordPacket("Notify setup incomplete on ${characteristic.uuid}")
@@ -412,10 +515,41 @@ class BmsBleScanner(
         frame: ByteArray,
         label: String
     ) {
-        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-        characteristic.value = frame
-        val ok = gatt.writeCharacteristic(characteristic)
+        val ok = writeCharacteristic(gatt, characteristic, frame)
         recordPacket("TX $label: ${frame.toHexString()} ${if (ok) "queued" else "failed"}")
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun writeCccdDescriptor(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            @Suppress("DEPRECATION")
+            gatt.writeDescriptor(descriptor)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun writeCharacteristic(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        frame: ByteArray
+    ): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeCharacteristic(
+                characteristic,
+                frame,
+                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            ) == BluetoothStatusCodes.SUCCESS
+        } else {
+            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            @Suppress("DEPRECATION")
+            characteristic.value = frame
+            @Suppress("DEPRECATION")
+            gatt.writeCharacteristic(characteristic)
+        }
     }
 
     private fun recordPacket(text: String) {
@@ -491,7 +625,7 @@ class BmsBleScanner(
         val fet = payload[20].toUByte().toInt()
         val cellCount = payload[21].toUByte().toInt()
         val ntcCount = payload[22].toUByte().toInt()
-        val tempF = if (ntcCount > 0 && payload.size >= 25) {
+        val tempF = if (ntcCount > 0) {
             val kelvinTenths = payload.u16(23)
             ((kelvinTenths / 10.0) - 273.15) * 9.0 / 5.0 + 32.0
         } else {
@@ -545,7 +679,10 @@ class BmsBleScanner(
 
     companion object {
         private const val SCAN_WINDOW_MS = 20_000L
-        private const val POLL_INTERVAL_MS = 2_000L
+        private const val AUTO_CONNECT_RETRIES = 3
+        private const val AUTO_CONNECT_RETRY_DELAY_MS = 2_500L
+        private const val CONNECT_TIMEOUT_MS = 12_000L
+        private const val POLL_INTERVAL_MS = 1_500L
         private const val MAX_RAW_PACKETS = 40
         private const val PREFS_NAME = "bms_ble"
         private const val PREF_BMS_ADDRESS = "preferred_bms_address"

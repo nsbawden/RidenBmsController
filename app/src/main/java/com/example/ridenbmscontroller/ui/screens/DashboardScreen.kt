@@ -29,11 +29,11 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.ridenbmscontroller.model.AppState
@@ -48,6 +48,7 @@ import com.example.ridenbmscontroller.ui.theme.TextPrimary
 import com.example.ridenbmscontroller.ui.theme.VoltageAmber
 import com.example.ridenbmscontroller.ui.theme.WarningOrange
 import kotlin.math.cos
+import kotlin.math.max
 import kotlin.math.sin
 
 @Composable
@@ -105,15 +106,20 @@ private fun HalfCircleSocGauge(state: AppState) {
     val soc = state.battery.socPercent.coerceIn(0, 100)
     val lowSocActive = state.alerts.lowSocAlarmActive
     val gaugeColor = if (lowSocActive) WarningOrange else BatteryGreen
-    val chargeText = when (state.battery.direction) {
+    val deviceIssueText = deviceIssueText(state)
+    val chargeText = deviceIssueText ?: when (state.battery.direction) {
         PowerDirection.Charging -> "CHARGING"
         PowerDirection.Discharging -> "DISCHARGING"
         PowerDirection.Idle -> "IDLE"
     }
-    val chargeColor = when (state.battery.direction) {
-        PowerDirection.Charging -> if (lowSocActive) WarningOrange else BatteryGreen
-        PowerDirection.Discharging -> VoltageAmber
-        PowerDirection.Idle -> TextMuted
+    val chargeColor = if (deviceIssueText != null) {
+        DeviceRed
+    } else {
+        when (state.battery.direction) {
+            PowerDirection.Charging -> if (lowSocActive) WarningOrange else BatteryGreen
+            PowerDirection.Discharging -> VoltageAmber
+            PowerDirection.Idle -> TextMuted
+        }
     }
     val capacityText = formatAmpHourProgress(state.battery.remainingAh, state.battery.nominalAh)
 
@@ -188,45 +194,55 @@ private fun HalfCircleSocGauge(state: AppState) {
                 fontWeight = FontWeight.Bold
             )
             Text(
-                text = buildAnnotatedString {
-                    withStyle(SpanStyle(color = chargeColor)) {
-                        append(chargeText)
-                    }
-                    withStyle(SpanStyle(color = TextMuted)) {
-                        append("  |  ")
-                    }
-                    withStyle(SpanStyle(color = TextMuted)) {
-                        append(capacityText)
-                    }
-                },
+                text = chargeText,
+                color = chargeColor,
                 fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold
             )
             Text(
-                text = "Cell delta ${state.battery.cellDeltaMv} mV",
+                text = capacityText,
                 color = TextMuted,
                 fontSize = 12.sp
             )
             Row(
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .background(
-                            color = if (state.battery.balancing) WarningOrange else TextMuted.copy(alpha = 0.35f),
-                            shape = CircleShape
-                        )
-                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .background(
+                                color = if (state.battery.balancing) WarningOrange else TextMuted.copy(alpha = 0.35f),
+                                shape = CircleShape
+                            )
+                    )
+                    Text(
+                        text = "BAL ${if (state.battery.balancing) "ON" else "OFF"}",
+                        color = if (state.battery.balancing) WarningOrange else TextMuted,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
                 Text(
-                    text = "BAL ${if (state.battery.balancing) "ON" else "OFF"}",
-                    color = if (state.battery.balancing) WarningOrange else TextMuted,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.SemiBold
+                    text = "Delta ${state.battery.cellDeltaMv} mV",
+                    color = TextMuted,
+                    fontSize = 11.sp
                 )
             }
         }
+    }
+}
+
+private fun deviceIssueText(state: AppState): String? {
+    return when {
+        !state.controller.bmsConnected && !state.controller.ridenConnected -> "BMS + RIDEN OFFLINE"
+        !state.controller.bmsConnected -> "BMS OFFLINE"
+        !state.controller.ridenConnected -> "RIDEN OFFLINE"
+        else -> null
     }
 }
 
@@ -272,22 +288,12 @@ private fun RidenPanel(state: AppState) {
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text("Riden / Solar", fontWeight = FontWeight.SemiBold)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ValueTile("Target PV", "%.1f".format(state.riden.targetVin), "V", VoltageAmber, Modifier.weight(1f))
-                ValueTile("VSET", "%.2f".format(state.riden.vset), "V", VoltageAmber, Modifier.weight(1f))
-                ValueTile("ISET", "%.2f".format(state.riden.iset), "A", CurrentRose, Modifier.weight(1f))
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ValueTile("VIN", "%.2f".format(state.riden.vin), "V", VoltageAmber, Modifier.weight(1f))
-                ValueTile("VOUT", "%.2f".format(state.riden.vout), "V", VoltageAmber, Modifier.weight(1f))
-                ValueTile("IOUT", "%.2f".format(state.riden.iout), "A", CurrentRose, Modifier.weight(1f))
-            }
+            SolarSplitHeader(state)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ValueTile("Watts", "%.0f".format(state.riden.watts), "W", PowerBlue, Modifier.weight(1f))
                 ValueTile(
                     "Recovery",
-                    if (state.controller.recoveryActive) "On" else "Off",
+                    recoveryTileValue(state),
                     "",
                     if (state.controller.recoveryActive) WarningOrange else TextMuted,
                     Modifier.weight(1f)
@@ -301,6 +307,16 @@ private fun RidenPanel(state: AppState) {
                 )
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ValueTile("Target PV", "%.1f".format(state.riden.targetVin), "V", VoltageAmber, Modifier.weight(1f))
+                ValueTile("VSET", "%.2f".format(state.riden.vset), "V", VoltageAmber, Modifier.weight(1f))
+                ValueTile("ISET", "%.2f".format(state.riden.iset), "A", CurrentRose, Modifier.weight(1f))
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ValueTile("VIN", "%.2f".format(state.riden.vin), "V", VoltageAmber, Modifier.weight(1f))
+                ValueTile("VOUT", "%.2f".format(state.riden.vout), "V", VoltageAmber, Modifier.weight(1f))
+                ValueTile("IOUT", "%.2f".format(state.riden.iout), "A", CurrentRose, Modifier.weight(1f))
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 val today = state.energy.whToday.formatWattHours()
                 val yesterday = state.energy.whYesterday.formatWattHours()
                 val total = state.energy.whTotal.formatWattHours()
@@ -309,6 +325,78 @@ private fun RidenPanel(state: AppState) {
                 ValueTile("Wh Total", total.value, total.unit, TextPrimary, Modifier.weight(1f))
             }
         }
+    }
+}
+
+@Composable
+private fun SolarSplitHeader(state: AppState) {
+    val solarWatts = state.riden.watts.coerceAtLeast(0.0)
+    val solarActive = solarWatts > 1.0
+    val batteryWatts = if (solarActive) state.battery.watts.coerceAtLeast(0.0).coerceAtMost(solarWatts) else 0.0
+    val loadWatts = if (solarActive) (solarWatts - batteryWatts).coerceAtLeast(0.0) else 0.0
+    val total = max(solarWatts, batteryWatts + loadWatts)
+    val batteryFraction = if (total > 1.0) (batteryWatts / total).toFloat().coerceIn(0f, 1f) else 0f
+
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Solar", fontWeight = FontWeight.SemiBold)
+            Text(
+                buildAnnotatedString {
+                    withStyle(SpanStyle(color = TextMuted)) { append("Batt ") }
+                    withStyle(SpanStyle(color = if (solarActive) BatteryGreen else TextMuted)) { append(batteryWatts.formatWholeWatts()) }
+                    withStyle(SpanStyle(color = TextMuted)) { append("  Load ") }
+                    withStyle(SpanStyle(color = if (solarActive) VoltageAmber else TextMuted)) { append(loadWatts.formatWholeWatts()) }
+                },
+                color = TextMuted,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+        Canvas(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(14.dp)
+        ) {
+            val radius = 4.dp.toPx()
+            drawRoundRect(
+                color = PanelAlt,
+                size = size,
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(radius, radius)
+            )
+            if (solarActive && total > 1.0) {
+                val batteryWidth = size.width * batteryFraction
+                val loadWidth = size.width - batteryWidth
+                if (batteryWidth > 0f) {
+                    drawRoundRect(
+                        color = BatteryGreen,
+                        size = Size(batteryWidth, size.height),
+                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(radius, radius)
+                    )
+                }
+                if (loadWidth > 0f) {
+                    drawRoundRect(
+                        color = VoltageAmber,
+                        topLeft = Offset(batteryWidth, 0f),
+                        size = Size(loadWidth, size.height),
+                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(radius, radius)
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun recoveryTileValue(state: AppState): String {
+    if (!state.controller.recoveryActive) return "Off"
+    if (state.controller.recoveryCycleCount > 0) return "Cycle ${state.controller.recoveryCycleCount}"
+    return when (state.controller.recoveryPhase) {
+        "Waiting VIN" -> "Wait VIN"
+        "--" -> "Recover"
+        else -> state.controller.recoveryPhase
     }
 }
 
@@ -325,32 +413,33 @@ private fun ControllerPanel(state: AppState) {
         ) {
             Text("Controller", fontWeight = FontWeight.SemiBold)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                StatusChip(if (state.controller.enabled) state.controller.pvMode else "Off", modeColor(state.controller.pvMode), Modifier.weight(1f))
-                StatusChip("Policy ${"%.2f".format(state.controller.policyLimitAmps)}A", CurrentRose, Modifier.weight(1f))
+                StatusChip(
+                    if (state.controller.enabled) state.controller.pvMode else "Off",
+                    modeColor(state.controller.pvMode),
+                    Modifier.weight(1f)
+                )
+                StatusChip(
+                    if (state.controller.recoveryActive) {
+                        state.controller.recoveryPhase
+                    } else {
+                        "Band ${state.controller.controlBand} ${"%.2f".format(state.controller.controlStepAmps)}"
+                    },
+                    if (state.controller.recoveryActive) WarningOrange else PowerBlue,
+                    Modifier.weight(1f)
+                )
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 StatusChip("Knee ${"%.1f".format(state.controller.targetPvVolts)}V", VoltageAmber, Modifier.weight(1f))
                 StatusChip("Err ${"%+.1f".format(state.controller.vinErrorVolts)}V", errorColor(state.controller.vinErrorVolts), Modifier.weight(1f))
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                StatusChip("ISET ${"%.2f".format(state.controller.commandIset)}A", CurrentRose, Modifier.weight(1f))
+                StatusChip(
+                    "ISET ${"%.2f".format(state.controller.commandIset)}A",
+                    CurrentRose,
+                    Modifier.weight(1f),
+                    tintedBackground = false
+                )
                 StatusChip("Offset ${"%+.1f".format(state.controller.kneeOffsetVolts)}V", VoltageAmber, Modifier.weight(1f))
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                StatusChip(
-                    if (state.controller.recoveryActive) state.controller.recoveryPhase else "Band ${state.controller.controlBand}",
-                    if (state.controller.recoveryActive) WarningOrange else PowerBlue,
-                    Modifier.weight(1f)
-                )
-                StatusChip(
-                    when {
-                        !state.controller.bmsConnected -> "BMS Offline"
-                        !state.controller.ridenConnected -> "Riden Offline"
-                        else -> "Devices Online"
-                    },
-                    if (state.controller.bmsConnected && state.controller.ridenConnected) BatteryGreen else WarningOrange,
-                    Modifier.weight(1f)
-                )
             }
             Text(state.controller.status, color = TextMuted, fontSize = 13.sp)
         }
@@ -391,25 +480,47 @@ internal fun ValueTile(
 }
 
 @Composable
-private fun StatusChip(text: String, color: Color, modifier: Modifier = Modifier) {
+private fun StatusChip(
+    text: String,
+    color: Color,
+    modifier: Modifier = Modifier,
+    tintedBackground: Boolean = true
+) {
     Surface(
-        color = color.copy(alpha = 0.16f),
+        color = if (tintedBackground) color.copy(alpha = 0.16f) else PanelAlt,
         shape = RoundedCornerShape(8.dp),
         modifier = modifier.height(40.dp)
     ) {
         Box(contentAlignment = Alignment.Center) {
-            Text(text, color = color, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Text(
+                text = text,
+                color = color,
+                fontSize = text.statusChipFontSize(),
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth()
+            )
         }
     }
 }
 
 private data class CompactEnergy(val value: String, val unit: String)
 
+private val DeviceRed = Color(0xFFFF4D4D)
+
 private fun String.tileValueFontSize() = when {
     length >= 8 -> 20.sp
     length >= 7 -> 21.sp
     length >= 6 -> 22.sp
     else -> 24.sp
+}
+
+private fun String.statusChipFontSize() = when {
+    length >= 15 -> 15.sp
+    length >= 12 -> 16.sp
+    length >= 9 -> 17.sp
+    else -> 18.sp
 }
 
 private fun modeColor(mode: String): Color {
@@ -442,7 +553,11 @@ private fun formatAmpHourProgress(remainingAh: Double?, nominalAh: Double?): Str
 }
 
 private fun Double.roundAh(): String {
-    return "%.0f".format(this)
+    return "%.2f".format(this)
+}
+
+private fun Double.formatWholeWatts(): String {
+    return "%.0fW".format(this)
 }
 
 private fun Double.formatWattHours(): CompactEnergy {
