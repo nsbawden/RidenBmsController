@@ -8,9 +8,7 @@ enum class PowerDirection {
 
 enum class ChargeMode {
     Bulk,
-    Absorb,
     Balance,
-    Hold,
     Idle
 }
 
@@ -55,6 +53,9 @@ data class ControllerState(
     val commandIset: Double,
     val targetPvVolts: Double,
     val kneeOffsetVolts: Double,
+    val vinErrorVolts: Double,
+    val policyLimitAmps: Double,
+    val recoveryPhase: String,
     val controlBand: String,
     val ridenConnected: Boolean,
     val bmsConnected: Boolean,
@@ -80,7 +81,10 @@ data class AppSettings(
     val socHoldCurrentAmps: Double,
     val bmsCurrentDeadbandAmps: Double,
     val lowSocAlarmPercent: Int,
+    val kneeVarianceVolts: Double,
+    val kneeStepVolts: Double,
     val kneeTrackingDelaySeconds: Double,
+    val controllerLoopMs: Int,
     val keepScreenOn: Boolean
 )
 
@@ -149,6 +153,9 @@ data class AppState(
                 commandIset = 0.0,
                 targetPvVolts = 33.0,
                 kneeOffsetVolts = 0.0,
+                vinErrorVolts = 0.0,
+                policyLimitAmps = 0.0,
+                recoveryPhase = "--",
                 controlBand = "--",
                 ridenConnected = false,
                 bmsConnected = false,
@@ -172,7 +179,10 @@ data class AppState(
                 socHoldCurrentAmps = 0.5,
                 bmsCurrentDeadbandAmps = 1.0,
                 lowSocAlarmPercent = 20,
+                kneeVarianceVolts = 3.0,
+                kneeStepVolts = 0.10,
                 kneeTrackingDelaySeconds = 12.0,
+                controllerLoopMs = 200,
                 keepScreenOn = true
             ),
             history = emptyList(),

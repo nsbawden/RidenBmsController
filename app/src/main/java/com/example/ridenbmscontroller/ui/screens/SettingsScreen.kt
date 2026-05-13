@@ -96,8 +96,17 @@ fun SettingsScreen(
             NumberFieldRow("Target PV voltage", settings.targetPvVolts, "V", 10.0, 150.0) {
                 onSettingsChanged(settings.copy(targetPvVolts = it))
             }
+            NumberFieldRow("Knee variance", settings.kneeVarianceVolts, "V", 0.0, 10.0) {
+                onSettingsChanged(settings.copy(kneeVarianceVolts = it))
+            }
+            NumberFieldRow("Knee step", settings.kneeStepVolts, "V", 0.01, 1.0) {
+                onSettingsChanged(settings.copy(kneeStepVolts = it))
+            }
             NumberFieldRow("Knee Tracking Delay", settings.kneeTrackingDelaySeconds, "s", 0.0, 300.0) {
                 onSettingsChanged(settings.copy(kneeTrackingDelaySeconds = it))
+            }
+            IntFieldRow("Controller loop", settings.controllerLoopMs, "ms", 100, 2000) {
+                onSettingsChanged(settings.copy(controllerLoopMs = it))
             }
             ToggleRow("Controller enabled", settings.controllerEnabled) {
                 onSettingsChanged(settings.copy(controllerEnabled = it))

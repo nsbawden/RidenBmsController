@@ -84,6 +84,16 @@ Build a debug APK:
 
 Open the folder in Android Studio to build, install, and debug on a phone.
 
+## Adapting Other Hardware
+
+The Riden-specific code is intentionally separated from the higher-level controller model:
+
+- `app/src/main/java/com/example/ridenbmscontroller/riden/` contains the Riden USB/Modbus adapter, register addresses, scaling, and command details.
+- `SolarMpptController.kt` contains the reusable control model: BMS/SOC policy, solar knee tracking, and collapse recovery.
+- `BmsBleScanner.kt` contains the JBD/Xiaoxiang BLE adapter and protocol decoding.
+
+For a programmable MPPT controller, the Riden adapter is the main piece to replace. A real MPPT may already handle panel knee tracking internally, in which case the Riden-specific falloff/recovery behavior can be removed or bypassed while keeping the BMS/SOC policy layer and Android dashboard.
+
 ## Safety
 
 This app controls real charging hardware. Use conservative voltage and current limits, verify BMS alarm behavior, and test with supervision before leaving a system unattended. The BMS should remain the final hardware-level protection layer; this app is an additional controller, not a replacement for proper battery protection.

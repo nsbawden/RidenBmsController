@@ -101,29 +101,7 @@ fun DevicesScreen(
                 ) {
                     Text("Disconnect BMS")
                 }
-            }
-        }
 
-        Surface(color = Panel, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Riden USB", fontWeight = FontWeight.SemiBold)
-                StatusRow("Connection", if (ridenState.connected) "Online" else "Offline", ridenState.connected)
-                StatusRow("Permission", if (ridenState.permissionNeeded) "Needed" else "OK", !ridenState.permissionNeeded)
-                TelemetryRow("Status", ridenState.status)
-                ridenState.deviceName?.let { TelemetryRow("Device", it) }
-                if (ridenState.vendorId != null && ridenState.productId != null) {
-                    TelemetryRow("VID/PID", "%04X:%04X".format(ridenState.vendorId, ridenState.productId))
-                }
-                val telemetry = ridenState.telemetry
-                telemetry.vin?.let { TelemetryRow("VIN", "%.2f V".format(it)) }
-                telemetry.vout?.let { TelemetryRow("VOUT", "%.2f V".format(it)) }
-                telemetry.iout?.let { TelemetryRow("IOUT", "%.2f A".format(it)) }
-                telemetry.watts?.let { TelemetryRow("Power", "%.1f W".format(it)) }
-            }
-        }
-
-        Surface(color = Panel, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
@@ -180,6 +158,24 @@ fun DevicesScreen(
                         }
                     }
                 }
+            }
+        }
+
+        Surface(color = Panel, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Riden USB", fontWeight = FontWeight.SemiBold)
+                StatusRow("Connection", if (ridenState.connected) "Online" else "Offline", ridenState.connected)
+                StatusRow("Permission", if (ridenState.permissionNeeded) "Needed" else "OK", !ridenState.permissionNeeded)
+                TelemetryRow("Status", ridenState.status)
+                ridenState.deviceName?.let { TelemetryRow("Device", it) }
+                if (ridenState.vendorId != null && ridenState.productId != null) {
+                    TelemetryRow("VID/PID", "%04X:%04X".format(ridenState.vendorId, ridenState.productId))
+                }
+                val telemetry = ridenState.telemetry
+                telemetry.vin?.let { TelemetryRow("VIN", "%.2f V".format(it)) }
+                telemetry.vout?.let { TelemetryRow("VOUT", "%.2f V".format(it)) }
+                telemetry.iout?.let { TelemetryRow("IOUT", "%.2f A".format(it)) }
+                telemetry.watts?.let { TelemetryRow("Power", "%.1f W".format(it)) }
             }
         }
 

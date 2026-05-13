@@ -53,8 +53,8 @@ import kotlin.math.sin
 @Composable
 fun DashboardScreen(
     state: AppState,
-    onSilenceLowSocAlarm: () -> Unit = {},
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onSilenceLowSocAlarm: () -> Unit = {}
 ) {
     Column(
         modifier = modifier
@@ -92,7 +92,7 @@ private fun BatteryGaugeCard(state: AppState, onSilenceLowSocAlarm: () -> Unit) 
                 modifier = Modifier.fillMaxWidth()
             ) {
                 ValueTile("Battery V", "%.2f".format(state.battery.volts), "V", VoltageAmber, Modifier.weight(1f))
-                ValueTile("Battery A", "%.1f".format(state.battery.amps), "A", CurrentRose, Modifier.weight(1f))
+                ValueTile("Battery A", "%.2f".format(state.battery.amps), "A", CurrentRose, Modifier.weight(1f))
                 ValueTile("BMS Watts", "%.0f".format(state.battery.watts), "W", PowerBlue, Modifier.weight(1f))
                 ValueTile("Temp", "%.0f".format(state.battery.temperatureF), "F", WarningOrange, Modifier.weight(1f))
             }
@@ -276,12 +276,12 @@ private fun RidenPanel(state: AppState) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ValueTile("Target PV", "%.1f".format(state.riden.targetVin), "V", VoltageAmber, Modifier.weight(1f))
                 ValueTile("VSET", "%.2f".format(state.riden.vset), "V", VoltageAmber, Modifier.weight(1f))
-                ValueTile("ISET", "%.1f".format(state.riden.iset), "A", CurrentRose, Modifier.weight(1f))
+                ValueTile("ISET", "%.2f".format(state.riden.iset), "A", CurrentRose, Modifier.weight(1f))
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ValueTile("VIN", "%.2f".format(state.riden.vin), "V", VoltageAmber, Modifier.weight(1f))
                 ValueTile("VOUT", "%.2f".format(state.riden.vout), "V", VoltageAmber, Modifier.weight(1f))
-                ValueTile("IOUT", "%.1f".format(state.riden.iout), "A", CurrentRose, Modifier.weight(1f))
+                ValueTile("IOUT", "%.2f".format(state.riden.iout), "A", CurrentRose, Modifier.weight(1f))
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ValueTile("Watts", "%.0f".format(state.riden.watts), "W", PowerBlue, Modifier.weight(1f))
@@ -325,20 +325,32 @@ private fun ControllerPanel(state: AppState) {
         ) {
             Text("Controller", fontWeight = FontWeight.SemiBold)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                StatusChip(if (state.controller.enabled) "Enabled" else "Off", BatteryGreen, Modifier.weight(1f))
-                StatusChip("Solar ${state.controller.pvMode}", PowerBlue, Modifier.weight(1f))
+                StatusChip(if (state.controller.enabled) state.controller.pvMode else "Off", modeColor(state.controller.pvMode), Modifier.weight(1f))
+                StatusChip("Policy ${"%.2f".format(state.controller.policyLimitAmps)}A", CurrentRose, Modifier.weight(1f))
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                StatusChip("Target ${"%.1f".format(state.controller.targetChargeCurrent)}A", CurrentRose, Modifier.weight(1f))
-                StatusChip("ISET ${"%.1f".format(state.controller.commandIset)}A", CurrentRose, Modifier.weight(1f))
+                StatusChip("Knee ${"%.1f".format(state.controller.targetPvVolts)}V", VoltageAmber, Modifier.weight(1f))
+                StatusChip("Err ${"%+.1f".format(state.controller.vinErrorVolts)}V", errorColor(state.controller.vinErrorVolts), Modifier.weight(1f))
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                StatusChip("Band ${state.controller.controlBand}", PowerBlue, Modifier.weight(1f))
-                StatusChip("Knee ${"%+.1f".format(state.controller.kneeOffsetVolts)}V", VoltageAmber, Modifier.weight(1f))
+                StatusChip("ISET ${"%.2f".format(state.controller.commandIset)}A", CurrentRose, Modifier.weight(1f))
+                StatusChip("Offset ${"%+.1f".format(state.controller.kneeOffsetVolts)}V", VoltageAmber, Modifier.weight(1f))
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                StatusChip(if (state.controller.bmsConnected) "BMS Online" else "BMS Offline", BatteryGreen, Modifier.weight(1f))
-                StatusChip(if (state.controller.ridenConnected) "Riden Online" else "Riden Offline", BatteryGreen, Modifier.weight(1f))
+                StatusChip(
+                    if (state.controller.recoveryActive) state.controller.recoveryPhase else "Band ${state.controller.controlBand}",
+                    if (state.controller.recoveryActive) WarningOrange else PowerBlue,
+                    Modifier.weight(1f)
+                )
+                StatusChip(
+                    when {
+                        !state.controller.bmsConnected -> "BMS Offline"
+                        !state.controller.ridenConnected -> "Riden Offline"
+                        else -> "Devices Online"
+                    },
+                    if (state.controller.bmsConnected && state.controller.ridenConnected) BatteryGreen else WarningOrange,
+                    Modifier.weight(1f)
+                )
             }
             Text(state.controller.status, color = TextMuted, fontSize = 13.sp)
         }
@@ -398,6 +410,24 @@ private fun String.tileValueFontSize() = when {
     length >= 7 -> 21.sp
     length >= 6 -> 22.sp
     else -> 24.sp
+}
+
+private fun modeColor(mode: String): Color {
+    return when (mode) {
+        "Recover", "Alarm" -> WarningOrange
+        "SOC Hold", "Tracking" -> BatteryGreen
+        "Balance" -> WarningOrange
+        "Voltage Limit" -> VoltageAmber
+        else -> TextMuted
+    }
+}
+
+private fun errorColor(errorVolts: Double): Color {
+    return when {
+        kotlin.math.abs(errorVolts) <= 0.50 -> BatteryGreen
+        errorVolts < 0.0 -> WarningOrange
+        else -> PowerBlue
+    }
 }
 
 private fun formatAmpHourProgress(remainingAh: Double?, nominalAh: Double?): String {

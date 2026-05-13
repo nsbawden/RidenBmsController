@@ -1,7 +1,6 @@
 package com.example.ridenbmscontroller
 
 import android.os.Bundle
-import android.content.Context
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.SystemClock
@@ -9,6 +8,7 @@ import android.view.WindowManager
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.core.content.edit
 import androidx.lifecycle.lifecycleScope
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Icon
@@ -342,7 +342,7 @@ class MainActivity : ComponentActivity() {
 
     private fun loadSettings(): AppSettings {
         val defaults = AppState.preview.settings
-        val prefs = getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE)
+        val prefs = getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
         return AppSettings(
             maxBatteryVolts = prefs.getFloat(
                 KEY_MAX_BATTERY_V,
@@ -366,30 +366,41 @@ class MainActivity : ComponentActivity() {
                 defaults.bmsCurrentDeadbandAmps.toFloat()
             ).toDouble(),
             lowSocAlarmPercent = prefs.getInt(KEY_LOW_SOC_ALARM_PERCENT, defaults.lowSocAlarmPercent),
+            kneeVarianceVolts = prefs.getFloat(
+                KEY_KNEE_VARIANCE_V,
+                defaults.kneeVarianceVolts.toFloat()
+            ).toDouble(),
+            kneeStepVolts = prefs.getFloat(
+                KEY_KNEE_STEP_V,
+                defaults.kneeStepVolts.toFloat()
+            ).toDouble(),
             kneeTrackingDelaySeconds = prefs.getFloat(
                 KEY_KNEE_TRACKING_DELAY_S,
                 prefs.getFloat(KEY_HCC_QUIET_S, defaults.kneeTrackingDelaySeconds.toFloat())
             ).toDouble(),
+            controllerLoopMs = prefs.getInt(KEY_CONTROLLER_LOOP_MS, defaults.controllerLoopMs),
             keepScreenOn = prefs.getBoolean(KEY_KEEP_SCREEN_ON, defaults.keepScreenOn)
         )
     }
 
     private fun saveSettings(settings: AppSettings) {
-        getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .putFloat(KEY_MAX_BATTERY_V, settings.maxBatteryVolts.toFloat())
-            .putInt(KEY_BALANCE_EVERY_DAYS, settings.balanceEveryDays)
-            .putLong(KEY_LAST_BALANCE_EPOCH_DAY, settings.lastBalanceEpochDay)
-            .putFloat(KEY_MAX_CHARGE_A, settings.maxChargeAmps.toFloat())
-            .putFloat(KEY_TARGET_PV_V, settings.targetPvVolts.toFloat())
-            .putBoolean(KEY_CONTROLLER_ENABLED, settings.controllerEnabled)
-            .putInt(KEY_NORMAL_SOC_CEILING_PERCENT, settings.normalSocCeilingPercent)
-            .putFloat(KEY_SOC_HOLD_CURRENT_A, settings.socHoldCurrentAmps.toFloat())
-            .putFloat(KEY_BMS_CURRENT_DEADBAND_A, settings.bmsCurrentDeadbandAmps.toFloat())
-            .putInt(KEY_LOW_SOC_ALARM_PERCENT, settings.lowSocAlarmPercent)
-            .putFloat(KEY_KNEE_TRACKING_DELAY_S, settings.kneeTrackingDelaySeconds.toFloat())
-            .putBoolean(KEY_KEEP_SCREEN_ON, settings.keepScreenOn)
-            .apply()
+        getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE).edit {
+            putFloat(KEY_MAX_BATTERY_V, settings.maxBatteryVolts.toFloat())
+            putInt(KEY_BALANCE_EVERY_DAYS, settings.balanceEveryDays)
+            putLong(KEY_LAST_BALANCE_EPOCH_DAY, settings.lastBalanceEpochDay)
+            putFloat(KEY_MAX_CHARGE_A, settings.maxChargeAmps.toFloat())
+            putFloat(KEY_TARGET_PV_V, settings.targetPvVolts.toFloat())
+            putBoolean(KEY_CONTROLLER_ENABLED, settings.controllerEnabled)
+            putInt(KEY_NORMAL_SOC_CEILING_PERCENT, settings.normalSocCeilingPercent)
+            putFloat(KEY_SOC_HOLD_CURRENT_A, settings.socHoldCurrentAmps.toFloat())
+            putFloat(KEY_BMS_CURRENT_DEADBAND_A, settings.bmsCurrentDeadbandAmps.toFloat())
+            putInt(KEY_LOW_SOC_ALARM_PERCENT, settings.lowSocAlarmPercent)
+            putFloat(KEY_KNEE_VARIANCE_V, settings.kneeVarianceVolts.toFloat())
+            putFloat(KEY_KNEE_STEP_V, settings.kneeStepVolts.toFloat())
+            putFloat(KEY_KNEE_TRACKING_DELAY_S, settings.kneeTrackingDelaySeconds.toFloat())
+            putInt(KEY_CONTROLLER_LOOP_MS, settings.controllerLoopMs)
+            putBoolean(KEY_KEEP_SCREEN_ON, settings.keepScreenOn)
+        }
     }
 
     private fun markBalanceDayStarted(epochDay: Long) {
@@ -423,7 +434,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun loadEnergy() {
-        val prefs = getSharedPreferences(ENERGY_PREFS, Context.MODE_PRIVATE)
+        val prefs = getSharedPreferences(ENERGY_PREFS, MODE_PRIVATE)
         energyDayKey = prefs.getInt(KEY_ENERGY_DAY_KEY, 0)
         lastPersistEnergyMs = prefs.getLong(KEY_ENERGY_LAST_SAVE_MS, 0L)
         energyCounters = EnergyCounters(
@@ -533,16 +544,15 @@ class MainActivity : ComponentActivity() {
 
     private fun persistEnergy() {
         lastPersistEnergyMs = SystemClock.elapsedRealtime()
-        getSharedPreferences(ENERGY_PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .putInt(KEY_ENERGY_DAY_KEY, energyDayKey)
-            .putFloat(KEY_ENERGY_TODAY_WH, energyCounters.whToday.toFloat())
-            .putFloat(KEY_ENERGY_YESTERDAY_WH, energyCounters.whYesterday.toFloat())
-            .putFloat(KEY_ENERGY_TOTAL_WH, energyCounters.whTotal.toFloat())
-            .putFloat(KEY_BMS_ENERGY_TODAY_WH, energyCounters.bmsWhToday.toFloat())
-            .putFloat(KEY_BMS_ENERGY_YESTERDAY_WH, energyCounters.bmsWhYesterday.toFloat())
-            .putLong(KEY_ENERGY_LAST_SAVE_MS, lastPersistEnergyMs)
-            .commit()
+        getSharedPreferences(ENERGY_PREFS, MODE_PRIVATE).edit(commit = true) {
+            putInt(KEY_ENERGY_DAY_KEY, energyDayKey)
+            putFloat(KEY_ENERGY_TODAY_WH, energyCounters.whToday.toFloat())
+            putFloat(KEY_ENERGY_YESTERDAY_WH, energyCounters.whYesterday.toFloat())
+            putFloat(KEY_ENERGY_TOTAL_WH, energyCounters.whTotal.toFloat())
+            putFloat(KEY_BMS_ENERGY_TODAY_WH, energyCounters.bmsWhToday.toFloat())
+            putFloat(KEY_BMS_ENERGY_YESTERDAY_WH, energyCounters.bmsWhYesterday.toFloat())
+            putLong(KEY_ENERGY_LAST_SAVE_MS, lastPersistEnergyMs)
+        }
     }
 
     private fun maybePersistEnergy(nowMs: Long) {
@@ -671,8 +681,11 @@ class MainActivity : ComponentActivity() {
         private const val KEY_SOC_HOLD_CURRENT_A = "soc_hold_current_a"
         private const val KEY_BMS_CURRENT_DEADBAND_A = "bms_current_deadband_a"
         private const val KEY_LOW_SOC_ALARM_PERCENT = "low_soc_alarm_percent"
+        private const val KEY_KNEE_VARIANCE_V = "knee_variance_v"
+        private const val KEY_KNEE_STEP_V = "knee_step_v"
         private const val KEY_HCC_QUIET_S = "hcc_quiet_s"
         private const val KEY_KNEE_TRACKING_DELAY_S = "knee_tracking_delay_s"
+        private const val KEY_CONTROLLER_LOOP_MS = "controller_loop_ms"
         private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
         private const val KEY_ENERGY_DAY_KEY = "energy_day_key"
         private const val KEY_ENERGY_TODAY_WH = "energy_today_wh"
@@ -872,6 +885,9 @@ private fun AppState.withMpptControl(control: MpptControlState): AppState {
             commandIset = control.commandIset,
             targetPvVolts = control.targetPvVolts,
             kneeOffsetVolts = control.kneeOffsetVolts,
+            vinErrorVolts = control.vinErrorVolts,
+            policyLimitAmps = control.policyLimitAmps,
+            recoveryPhase = control.recoveryPhase,
             controlBand = control.controlBand,
             recoveryActive = control.recoveryActive,
             socTargetPercent = control.socTargetPercent.takeIf { it > 0 } ?: settings.normalSocCeilingPercent
@@ -973,6 +989,9 @@ private fun AppState.withBmsTelemetry(bleState: BmsBleUiState): AppState {
             commandIset = controller.commandIset,
             targetPvVolts = controller.targetPvVolts,
             kneeOffsetVolts = controller.kneeOffsetVolts,
+            vinErrorVolts = controller.vinErrorVolts,
+            policyLimitAmps = controller.policyLimitAmps,
+            recoveryPhase = controller.recoveryPhase,
             controlBand = controller.controlBand,
             ridenConnected = false,
             bmsConnected = bleState.connectedDeviceAddress != null,

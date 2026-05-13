@@ -23,6 +23,18 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
+/**
+ * Riden-specific hardware adapter.
+ *
+ * This class is intentionally the place where Riden USB/Modbus details live:
+ * USB serial discovery, CH340 preference, register addresses, register scaling,
+ * and the exact commands for VSET/ISET/output state.
+ *
+ * The higher-level controller should not know those details. If adapting this app
+ * to a real programmable MPPT controller, replace this package with an adapter that
+ * publishes charger telemetry and implements equivalent setOutput/setVoltage/setCurrent
+ * operations for that hardware.
+ */
 class RidenUsbMonitor(
     context: Context,
     private val scope: CoroutineScope,
@@ -214,6 +226,7 @@ class RidenUsbMonitor(
     }
 
     private suspend fun readTelemetry(io: ModbusIo): RidenTelemetry {
+        // Riden-specific register block. Values are centi-units in this model.
         val r = io.readHoldingRegs(SLAVE_ID, REG_BASE, 8)
         val outputOn = r[7] != 0
         return RidenTelemetry(
@@ -285,6 +298,8 @@ class RidenUsbMonitor(
     }
 
     companion object {
+        // Riden / CH340 USB and Modbus constants. These are not part of the generic
+        // BMS/SOC controller model; they belong to this hardware adapter only.
         private const val ACTION_USB_PERMISSION = "com.example.ridenbmscontroller.USB_PERMISSION"
         private const val VID_WCH = 0x1A86
         private const val PID_CH340 = 0x7523
