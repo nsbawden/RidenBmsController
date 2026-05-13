@@ -364,7 +364,15 @@ internal fun ValueTile(
             modifier = Modifier.padding(6.dp)
         ) {
             Text(label, color = TextMuted, fontSize = 10.sp, textAlign = TextAlign.Center, maxLines = 1)
-            Text(value, color = color, fontSize = 19.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+            Text(
+                text = value,
+                color = color,
+                fontSize = value.tileValueFontSize(),
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth()
+            )
             Text(unit, color = TextMuted, fontSize = 9.sp)
         }
     }
@@ -384,6 +392,13 @@ private fun StatusChip(text: String, color: Color, modifier: Modifier = Modifier
 }
 
 private data class CompactEnergy(val value: String, val unit: String)
+
+private fun String.tileValueFontSize() = when {
+    length >= 8 -> 20.sp
+    length >= 7 -> 21.sp
+    length >= 6 -> 22.sp
+    else -> 24.sp
+}
 
 private fun formatAmpHourProgress(remainingAh: Double?, nominalAh: Double?): String {
     return when {
