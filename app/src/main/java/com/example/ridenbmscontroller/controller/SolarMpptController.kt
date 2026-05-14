@@ -297,10 +297,16 @@ class SolarMpptController(
         }
         lastCollapseMs = now
         val step = (settings.kneeStepVolts * recentCollapseCount).coerceAtMost(maxCollapseStepVolts(settings))
+        val previousOffset = kneeOffsetVolts
         kneeOffsetVolts = (kneeOffsetVolts + step).coerceIn(
             -settings.kneeVarianceVolts,
             settings.kneeVarianceVolts
         )
+        if (kneeOffsetVolts > previousOffset) {
+            // Recovery just raised the learned knee, so give that safer point a full
+            // tracking-delay window before the normal down-probe tries lower again.
+            lastKneeProbeMs = now
+        }
     }
 
     private fun maxCollapseStepVolts(settings: AppSettings): Double {
