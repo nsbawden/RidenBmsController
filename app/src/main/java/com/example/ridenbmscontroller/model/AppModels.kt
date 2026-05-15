@@ -45,6 +45,36 @@ data class EnergyCounters(
     val bmsWhYesterday: Double
 )
 
+data class KneeLearningBin(
+    val index: Int,
+    val minIset: Double,
+    val maxIset: Double,
+    val learnedKneeVolts: Double?,
+    val confidence: Double,
+    val sampleCount: Int,
+    val stableSeconds: Double = 0.0,
+    val currentStableRunSeconds: Double = 0.0,
+    val longestStableRunSeconds: Double = 0.0,
+    val candidateKneeVolts: Double? = null,
+    val candidateStableSeconds: Double = 0.0,
+    val highestStableKneeVolts: Double? = null,
+    val highStableSeconds: Double = 0.0,
+    val highCurrentStableRunSeconds: Double = 0.0,
+    val highLongestStableRunSeconds: Double = 0.0,
+    val candidateHighKneeVolts: Double? = null,
+    val candidateHighStableSeconds: Double = 0.0,
+    val bestWatts: Double,
+    val lastIset: Double,
+    val lastIout: Double,
+    val lastWatts: Double,
+    val lastVinError: Double,
+    val lastTemperatureF: Double? = null,
+    val minTemperatureF: Double? = null,
+    val maxTemperatureF: Double? = null,
+    val lastUpdatedMs: Long,
+    val manual: Boolean
+)
+
 data class ControllerState(
     val enabled: Boolean,
     val pvMode: String,
@@ -83,7 +113,8 @@ data class AppSettings(
     val socHoldCurrentAmps: Double,
     val bmsCurrentDeadbandAmps: Double,
     val lowSocAlarmPercent: Int,
-    val kneeVarianceVolts: Double,
+    val minTargetPvVolts: Double,
+    val maxTargetPvVolts: Double,
     val kneeStepVolts: Double,
     val kneeTrackingDelaySeconds: Double,
     val controllerLoopMs: Int,
@@ -113,7 +144,9 @@ data class AppState(
     val settings: AppSettings,
     val history: List<HistoryPoint>,
     val events: List<String>,
-    val logs: List<String>
+    val logs: List<String>,
+    val kneeLearningBins: List<KneeLearningBin>,
+    val batteryTimeEstimateText: String
 ) {
     companion object {
         val preview = AppState(
@@ -183,7 +216,8 @@ data class AppState(
                 socHoldCurrentAmps = 0.5,
                 bmsCurrentDeadbandAmps = 1.0,
                 lowSocAlarmPercent = 20,
-                kneeVarianceVolts = 3.0,
+                minTargetPvVolts = 30.0,
+                maxTargetPvVolts = 36.0,
                 kneeStepVolts = 0.10,
                 kneeTrackingDelaySeconds = 12.0,
                 controllerLoopMs = 200,
@@ -191,7 +225,9 @@ data class AppState(
             ),
             history = emptyList(),
             events = emptyList(),
-            logs = emptyList()
+            logs = emptyList(),
+            kneeLearningBins = emptyList(),
+            batteryTimeEstimateText = ""
         )
     }
 }

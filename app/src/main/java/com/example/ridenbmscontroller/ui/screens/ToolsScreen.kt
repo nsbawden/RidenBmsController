@@ -9,29 +9,38 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.ridenbmscontroller.model.AppState
+import com.example.ridenbmscontroller.model.KneeLearningBin
 import com.example.ridenbmscontroller.ui.theme.BatteryGreen
 import com.example.ridenbmscontroller.ui.theme.CurrentRose
 import com.example.ridenbmscontroller.ui.theme.Panel
@@ -41,12 +50,19 @@ import com.example.ridenbmscontroller.ui.theme.TextMuted
 import com.example.ridenbmscontroller.ui.theme.VoltageAmber
 import com.example.ridenbmscontroller.ui.theme.WarningOrange
 import kotlin.math.abs
+import org.json.JSONArray
+import org.json.JSONObject
 
-private val toolTabs = listOf("Events", "Tuning", "Telemetry")
+private val toolTabs = listOf("Events", "Tuning", "Knee", "Telemetry")
 
 @Composable
-fun ToolsScreen(state: AppState, modifier: Modifier = Modifier) {
-    var selectedTab by remember { mutableIntStateOf(0) }
+fun ToolsScreen(
+    state: AppState,
+    modifier: Modifier = Modifier,
+    onSaveDebugSnapshot: (String) -> String = { "" },
+    onImportKneeData: (String) -> String = { "Import unavailable" }
+) {
+    var selectedTab by rememberSaveable { mutableIntStateOf(0) }
 
     Column(
         modifier = modifier
@@ -76,6 +92,7 @@ fun ToolsScreen(state: AppState, modifier: Modifier = Modifier) {
             when (selectedTab) {
                 0 -> EventsTool(state)
                 1 -> TuningTool(state)
+                2 -> KneeLearningTool(state, onSaveDebugSnapshot, onImportKneeData)
                 else -> TelemetryTool(state)
             }
         }
@@ -158,6 +175,296 @@ private fun TuningTool(state: AppState) {
         Text(guidance, color = TextMuted, fontSize = 13.sp)
         Text(state.controller.status, color = TextMuted, fontSize = 13.sp)
     }
+}
+
+@Composable
+private fun KneeLearningTool(
+    state: AppState,
+    onSaveDebugSnapshot: (String) -> String,
+    onImportKneeData: (String) -> String
+) {
+    val clipboard = LocalClipboardManager.current
+    var saveMessage by rememberSaveable { mutableStateOf("") }
+    var showImportDialog by rememberSaveable { mutableStateOf(false) }
+    var importText by rememberSaveable { mutableStateOf("") }
+    fun closeImportDialog() {
+        showImportDialog = false
+    }
+    ToolCard("Knee Learning") {
+        Text(
+            "Advisory only. Low knees learn after 30s stable; high knees require at least a full Knee Tracking Delay plus margin.",
+            color = TextMuted,
+            fontSize = 13.sp
+        )
+        MiniTile(
+            "Live",
+            "ISET ${"%.2f".format(state.controller.commandIset)}A",
+            "Knee ${"%.1f".format(state.controller.targetPvVolts)}V | Err ${"%+.2f".format(state.controller.vinErrorVolts)}V",
+            modeColor(state.controller.pvMode),
+            Modifier.fillMaxWidth()
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            Button(
+                onClick = { clipboard.setText(AnnotatedString(state.toKneeLearningJson())) },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Copy JSON")
+            }
+            Button(
+                onClick = {
+                    val path = onSaveDebugSnapshot(state.toKneeLearningJson())
+                    saveMessage = if (path.isBlank()) {
+                        "Save failed"
+                    } else {
+                        "Saved debug_snapshot.json"
+                    }
+                },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Save JSON")
+            }
+        }
+        Button(
+            onClick = {
+                importText = ""
+                showImportDialog = true
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Import Knee JSON")
+        }
+        if (saveMessage.isNotBlank()) {
+            Text(saveMessage, color = TextMuted, fontSize = 13.sp)
+        }
+    }
+    ToolCard("Learned Table") {
+        Column(Modifier.horizontalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            KneeTableHeader()
+            state.kneeLearningBins.forEach { bin ->
+                KneeBinRow(bin)
+            }
+        }
+    }
+    if (showImportDialog) {
+        AlertDialog(
+            onDismissRequest = { closeImportDialog() },
+            title = { Text("Import Knee Data") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Paste a full diagnostic JSON, a kneeLearningBins array, or a reset command.", color = TextMuted, fontSize = 13.sp)
+                    OutlinedTextField(
+                        value = importText,
+                        onValueChange = { importText = it },
+                        minLines = 6,
+                        maxLines = 10,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        saveMessage = onImportKneeData(importText)
+                        closeImportDialog()
+                    }
+                ) {
+                    Text("Import")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { closeImportDialog() }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+}
+
+private fun AppState.toKneeLearningJson(): String {
+    val root = JSONObject()
+        .put("schema", "riden-bms-knee-learning-v2")
+        .put("exportedAtMs", System.currentTimeMillis())
+        .put("settings", settingsJson())
+        .put("controller", controllerJson())
+        .put("battery", batteryJson())
+        .put("riden", ridenJson())
+        .put("kneeLearningBins", JSONArray().also { bins ->
+            kneeLearningBins.forEach { bins.put(it.toJson()) }
+        })
+    return root.toString(2)
+}
+
+private fun AppState.settingsJson(): JSONObject = JSONObject()
+    .put("maximumControllerVoltage", settings.maxBatteryVolts)
+    .put("balanceEveryDays", settings.balanceEveryDays)
+    .put("lastBalanceEpochDay", settings.lastBalanceEpochDay)
+    .put("maxChargeAmps", settings.maxChargeAmps)
+    .put("baseTargetPvVolts", settings.targetPvVolts)
+    .put("controllerEnabled", settings.controllerEnabled)
+    .put("normalSocCeilingPercent", settings.normalSocCeilingPercent)
+    .put("socHoldCurrentAmps", settings.socHoldCurrentAmps)
+    .put("bmsCurrentDeadbandAmps", settings.bmsCurrentDeadbandAmps)
+    .put("lowSocAlarmPercent", settings.lowSocAlarmPercent)
+    .put("minTargetPvVolts", settings.minTargetPvVolts)
+    .put("maxTargetPvVolts", settings.maxTargetPvVolts)
+    .put("kneeStepVolts", settings.kneeStepVolts)
+    .put("kneeTrackingDelaySeconds", settings.kneeTrackingDelaySeconds)
+    .put("controllerLoopMs", settings.controllerLoopMs)
+    .put("keepScreenOn", settings.keepScreenOn)
+
+private fun AppState.controllerJson(): JSONObject = JSONObject()
+    .put("enabled", controller.enabled)
+    .put("pvMode", controller.pvMode)
+    .put("status", controller.status)
+    .put("targetChargeCurrent", controller.targetChargeCurrent)
+    .put("commandIset", controller.commandIset)
+    .put("activeTargetPvVolts", controller.targetPvVolts)
+    .put("kneeOffsetVolts", controller.kneeOffsetVolts)
+    .put("vinErrorVolts", controller.vinErrorVolts)
+    .put("recoveryPhase", controller.recoveryPhase)
+    .put("recoveryCycleCount", controller.recoveryCycleCount)
+    .put("controlBand", controller.controlBand)
+    .put("controlStepAmps", controller.controlStepAmps)
+    .put("ridenConnected", controller.ridenConnected)
+    .put("bmsConnected", controller.bmsConnected)
+    .put("recoveryActive", controller.recoveryActive)
+    .put("socTargetPercent", controller.socTargetPercent)
+
+private fun AppState.batteryJson(): JSONObject = JSONObject()
+    .put("socPercent", battery.socPercent)
+    .put("volts", battery.volts)
+    .put("amps", battery.amps)
+    .put("watts", battery.watts)
+    .putNullable("remainingAh", battery.remainingAh)
+    .putNullable("nominalAh", battery.nominalAh)
+    .put("temperatureF", battery.temperatureF)
+    .put("direction", battery.direction.name)
+    .put("balancing", battery.balancing)
+    .put("cellDeltaMv", battery.cellDeltaMv)
+
+private fun AppState.ridenJson(): JSONObject = JSONObject()
+    .put("vin", riden.vin)
+    .put("vout", riden.vout)
+    .put("iout", riden.iout)
+    .put("watts", riden.watts)
+    .put("vset", riden.vset)
+    .put("iset", riden.iset)
+    .put("targetVin", riden.targetVin)
+
+private fun KneeLearningBin.toJson(): JSONObject = JSONObject()
+    .put("index", index)
+    .put("minIset", minIset)
+    .put("maxIset", maxIset)
+    .putNullable("learnedKneeVolts", learnedKneeVolts)
+    .put("confidence", confidence)
+    .put("sampleCount", sampleCount)
+    .put("stableSeconds", stableSeconds)
+    .put("currentStableRunSeconds", currentStableRunSeconds)
+    .put("longestStableRunSeconds", longestStableRunSeconds)
+    .putNullable("candidateKneeVolts", candidateKneeVolts)
+    .put("candidateStableSeconds", candidateStableSeconds)
+    .putNullable("highestStableKneeVolts", highestStableKneeVolts)
+    .put("highStableSeconds", highStableSeconds)
+    .put("highCurrentStableRunSeconds", highCurrentStableRunSeconds)
+    .put("highLongestStableRunSeconds", highLongestStableRunSeconds)
+    .putNullable("candidateHighKneeVolts", candidateHighKneeVolts)
+    .put("candidateHighStableSeconds", candidateHighStableSeconds)
+    .put("bestWatts", bestWatts)
+    .put("lastIset", lastIset)
+    .put("lastIout", lastIout)
+    .put("lastWatts", lastWatts)
+    .put("lastVinError", lastVinError)
+    .putNullable("lastTemperatureF", lastTemperatureF)
+    .putNullable("minTemperatureF", minTemperatureF)
+    .putNullable("maxTemperatureF", maxTemperatureF)
+    .put("lastUpdatedMs", lastUpdatedMs)
+    .put("manual", manual)
+
+private fun JSONObject.putNullable(name: String, value: Double?): JSONObject {
+    return put(name, value ?: JSONObject.NULL)
+}
+
+@Composable
+private fun KneeTableHeader() {
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+        TableText("ISET", 70)
+        TableText("Low", 88)
+        TableText("LoCand", 88)
+        TableText("High", 88)
+        TableText("HiCand", 88)
+        TableText("Conf", 52)
+        TableText("N", 36)
+        TableText("LoStbl", 78)
+        TableText("HiStbl", 78)
+        TableText("Temp", 94)
+        TableText("Best W", 62)
+        TableText("Last", 160)
+    }
+}
+
+@Composable
+private fun KneeBinRow(bin: KneeLearningBin) {
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+        TableText("%.0f-%.0fA".format(bin.minIset, bin.maxIset), 70)
+        TableText(bin.learnedKneeVolts?.let { "%.2fV".format(it) } ?: "--", 88, if (bin.manual) VoltageAmber else BatteryGreen)
+        TableText(
+            bin.candidateKneeVolts?.let { "%.2fV %.0fs".format(it, bin.candidateStableSeconds) } ?: "--",
+            88,
+            VoltageAmber
+        )
+        TableText(bin.highestStableKneeVolts?.let { "%.2fV".format(it) } ?: "--", 88, PowerBlue)
+        TableText(
+            bin.candidateHighKneeVolts?.let { "%.2fV %.0fs".format(it, bin.candidateHighStableSeconds) } ?: "--",
+            88,
+            VoltageAmber
+        )
+        TableText("%.0f%%".format(bin.confidence * 100.0), 52)
+        TableText(bin.sampleCount.toString(), 36)
+        TableText(
+            "%.0f/%.0fs".format(bin.stableSeconds, bin.longestStableRunSeconds),
+            78
+        )
+        TableText(
+            "%.0f/%.0fs".format(bin.highStableSeconds, bin.highLongestStableRunSeconds),
+            78
+        )
+        TableText(
+            formatTempRange(bin),
+            94
+        )
+        TableText("%.0f".format(bin.bestWatts), 62)
+        TableText(
+            if (bin.lastUpdatedMs == 0L) {
+                "--"
+            } else {
+                "%.1fA %.1fW err%+.2f".format(bin.lastIset, bin.lastWatts, bin.lastVinError)
+            },
+            160
+        )
+    }
+}
+
+private fun formatTempRange(bin: KneeLearningBin): String {
+    val last = bin.lastTemperatureF
+    val min = bin.minTemperatureF
+    val max = bin.maxTemperatureF
+    return when {
+        last == null -> "--"
+        min != null && max != null -> "%.0fF %.0f-%.0f".format(last, min, max)
+        else -> "%.0fF".format(last)
+    }
+}
+
+@Composable
+private fun TableText(text: String, widthDp: Int, color: Color = TextMuted) {
+    Text(
+        text = text,
+        color = color,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 12.sp,
+        maxLines = 1,
+        modifier = Modifier.width(widthDp.dp)
+    )
 }
 
 @Composable

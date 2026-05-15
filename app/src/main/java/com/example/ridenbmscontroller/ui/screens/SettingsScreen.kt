@@ -49,6 +49,7 @@ fun SettingsScreen(
     daysUntilNextBalance: Int,
     onToggleBalanceToday: () -> Unit,
     onResetEnergyTotal: () -> Unit,
+    onResetLearnedKnee: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -94,10 +95,20 @@ fun SettingsScreen(
                 onSettingsChanged(settings.copy(maxChargeAmps = it))
             }
             NumberFieldRow("Target PV voltage", settings.targetPvVolts, "V", 10.0, 150.0) {
-                onSettingsChanged(settings.copy(targetPvVolts = it))
+                onSettingsChanged(
+                    settings.copy(
+                        targetPvVolts = it,
+                        minTargetPvVolts = settings.minTargetPvVolts.coerceAtMost(it),
+                        maxTargetPvVolts = settings.maxTargetPvVolts.coerceAtLeast(it)
+                    )
+                )
+                onResetLearnedKnee()
             }
-            NumberFieldRow("Knee variance", settings.kneeVarianceVolts, "V", 0.0, 10.0) {
-                onSettingsChanged(settings.copy(kneeVarianceVolts = it))
+            NumberFieldRow("Minimum target PV", settings.minTargetPvVolts, "V", 10.0, 150.0) {
+                onSettingsChanged(settings.copy(minTargetPvVolts = it.coerceAtMost(settings.maxTargetPvVolts)))
+            }
+            NumberFieldRow("Maximum target PV", settings.maxTargetPvVolts, "V", 10.0, 150.0) {
+                onSettingsChanged(settings.copy(maxTargetPvVolts = it.coerceAtLeast(settings.minTargetPvVolts)))
             }
             NumberFieldRow("Knee step", settings.kneeStepVolts, "V", 0.01, 1.0) {
                 onSettingsChanged(settings.copy(kneeStepVolts = it))

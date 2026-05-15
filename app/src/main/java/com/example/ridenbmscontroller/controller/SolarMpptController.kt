@@ -62,6 +62,22 @@ class SolarMpptController(
     private var alarmBackoffMs = Tuning.ALARM_BASE_HOLD_MS
     private var lastAlarmStartMs = 0L
 
+    fun resetLearnedKnee() {
+        kneeOffsetVolts = 0.0
+        lastKneeProbeMs = System.currentTimeMillis()
+        recentCollapseCount = 0
+        lastCollapseMs = 0L
+        stableSinceMs = 0L
+    }
+
+    fun setActiveKnee(settings: AppSettings, targetPvVolts: Double) {
+        kneeOffsetVolts = clampKnee(settings, targetPvVolts) - settings.targetPvVolts
+        lastKneeProbeMs = System.currentTimeMillis()
+        recentCollapseCount = 0
+        lastCollapseMs = 0L
+        stableSinceMs = 0L
+    }
+
     fun tick(
         settings: AppSettings,
         bmsState: BmsBleUiState,
@@ -119,29 +135,32 @@ class SolarMpptController(
         val vin = riden.vin ?: 0.0
         val vout = riden.vout ?: 0.0
         val virtualKnee = virtualKnee(settings)
-        // Battery policy layer: BMS/SOC/voltage safety decides the maximum current that
-        // the solar layer may request. It does not decide how to hunt the solar knee.
+        // Battery policy layer: maxChargeAmps remains the hardware/request ceiling.
+        // At SOC hold or voltage limit, socHoldCurrentAmps is the desired *net BMS*
+        // current, not a hard Riden ISET cap. This lets solar keep carrying RV loads.
         val voltageLimited = vout >= settings.maxBatteryVolts - Tuning.VOLTAGE_LIMIT_EPS
-        val policyLimit = when {
-            socPercent >= socTarget -> settings.socHoldCurrentAmps
-            voltageLimited -> settings.socHoldCurrentAmps
-            else -> settings.maxChargeAmps
-        }.coerceAtLeast(Tuning.MIN_ISET)
+        val currentLimit = settings.maxChargeAmps.coerceAtLeast(Tuning.MIN_ISET)
+        val targetBatteryCurrent = if (socPercent >= socTarget || voltageLimited) {
+            settings.socHoldCurrentAmps
+        } else {
+            currentLimit
+        }
 
         ensureOutputAndVoltage(settings)
 
         val oldIset = currentIset(riden.iset)
         val nextIset = when {
             recoveryPhase != PHASE_NONE -> recover(settings, oldIset, vin, virtualKnee)
-            isCollapsed(settings, vin) -> enterRecovery(settings, oldIset, policyLimit, vin)
+            isCollapsed(settings, vin) -> enterRecovery(settings, oldIset, currentLimit, vin)
             socPercent >= socTarget || voltageLimited -> {
                 pvMode = if (balanceDay) MODE_BALANCE else if (socPercent >= socTarget) MODE_SOC_HOLD else MODE_VOLTAGE_LIMIT
                 recoveryPhase = PHASE_NONE
                 updateStableRecoveryReset(false, settings, vin, virtualKnee, now)
-                adjustForBatteryCurrent(oldIset, batteryAmps, policyLimit).coerceAtMost(policyLimit)
+                holdBatteryCurrentAtSolarKnee(oldIset, batteryAmps, targetBatteryCurrent, vin, virtualKnee)
+                    .coerceAtMost(currentLimit)
             }
             else -> trackSolarKnee(settings, oldIset, vin, virtualKnee, now)
-        }.coerceIn(Tuning.MIN_ISET, policyLimit.coerceAtLeast(Tuning.MIN_ISET))
+        }.coerceIn(Tuning.MIN_ISET, currentLimit)
 
         commandIset = quantAmps(nextIset)
         setIset(commandIset)
@@ -150,7 +169,7 @@ class SolarMpptController(
         publish(
             settings = settings,
             status = statusFor(balanceDay, socPercent >= socTarget, voltageLimited),
-            policyLimit = policyLimit,
+            policyLimit = targetBatteryCurrent,
             band = bandFor(finalVinError),
             stepAmps = stepFor(finalVinError),
             vinError = finalVinError,
@@ -172,10 +191,9 @@ class SolarMpptController(
         // while still allowing decisive movement when VIN is far from target.
         val error = vin - virtualKnee
         val absErr = abs(error)
-        val step = huntStep(absErr)
         val next = when {
-            error > Tuning.TRACK_DEADBAND_V -> oldIset + step
-            error < -Tuning.TRACK_DEADBAND_V -> oldIset - step
+            error > Tuning.TRACK_DEADBAND_V -> oldIset + huntStep(absErr, oldIset, Direction.Up)
+            error < -Tuning.TRACK_DEADBAND_V -> oldIset - huntStep(absErr, oldIset, Direction.Down)
             else -> oldIset
         }
 
@@ -188,10 +206,8 @@ class SolarMpptController(
         // collapse recovery will raise the knee back up.
         if (now - lastKneeProbeMs >= (settings.kneeTrackingDelaySeconds * 1000.0).toLong()) {
             lastKneeProbeMs = now
-            kneeOffsetVolts = (kneeOffsetVolts - settings.kneeStepVolts).coerceIn(
-                -settings.kneeVarianceVolts,
-                settings.kneeVarianceVolts
-            )
+            kneeOffsetVolts = clampKnee(settings, settings.targetPvVolts + kneeOffsetVolts - settings.kneeStepVolts) -
+                settings.targetPvVolts
         }
 
         return next
@@ -252,39 +268,68 @@ class SolarMpptController(
     }
 
     private fun isCollapsed(settings: AppSettings, vin: Double): Boolean {
-        val collapseFloor = settings.targetPvVolts - settings.kneeVarianceVolts - Tuning.COLLAPSE_FLOOR_EXTRA_MARGIN_V
+        val collapseFloor = lowKneeLimit(settings) - Tuning.COLLAPSE_FLOOR_EXTRA_MARGIN_V
         return vin > 0.0 && vin < collapseFloor
     }
 
     private fun recoveryExitFloor(settings: AppSettings): Double {
-        // Recovery exits at the low edge of the configured knee window. With target
-        // 33V and variance 3V, VIN >= 30V means the panel is no longer collapsed.
-        return settings.targetPvVolts - settings.kneeVarianceVolts
+        // Recovery exits at the configured low edge of the knee window. With min
+        // target 30V, VIN >= 30V means the panel is no longer collapsed.
+        return lowKneeLimit(settings)
     }
 
     private fun adjustForBatteryCurrent(oldIset: Double, batteryAmps: Double, targetBatteryAmps: Double): Double {
         return oldIset + (targetBatteryAmps - batteryAmps) * Tuning.BATTERY_CURRENT_GAIN
     }
 
+    private fun holdBatteryCurrentAtSolarKnee(
+        oldIset: Double,
+        batteryAmps: Double,
+        targetBatteryAmps: Double,
+        vin: Double,
+        virtualKnee: Double
+    ): Double {
+        val batteryDemandIset = adjustForBatteryCurrent(oldIset, batteryAmps, targetBatteryAmps)
+        val kneeError = vin - virtualKnee
+        return when {
+            // In hold mode, this means load support is asking for more current than
+            // the panels can sustain at the learned knee. Solar wins; back ISET down.
+            kneeError < -Tuning.TRACK_DEADBAND_V ->
+                oldIset - huntStep(abs(kneeError), oldIset, Direction.Down)
+            // With PV headroom available, let BMS net-current control raise or lower
+            // ISET to cover loads plus the configured battery trickle target.
+            else -> batteryDemandIset
+        }
+    }
+
     private fun recoveryDropStep(oldIset: Double): Double {
         return max(Tuning.RECOVERY_DROP_MIN_STEP_A, oldIset * Tuning.RECOVERY_DROP_FRACTION)
     }
 
-    private fun huntStep(absErr: Double): Double {
-        return stepForAbsError(absErr)
+    private fun huntStep(absErr: Double, iset: Double, direction: Direction): Double {
+        return scaledStepForAbsError(absErr, iset, direction)
     }
 
     private fun stepFor(vinError: Double): Double {
-        return if (pvMode == MODE_RECOVER) 0.0 else stepForAbsError(abs(vinError))
+        if (pvMode == MODE_RECOVER || abs(vinError) <= Tuning.TRACK_DEADBAND_V) return 0.0
+        val direction = if (vinError > 0.0) Direction.Up else Direction.Down
+        return scaledStepForAbsError(abs(vinError), commandIset, direction)
     }
 
-    private fun stepForAbsError(absErr: Double): Double {
-        return when {
+    private fun scaledStepForAbsError(absErr: Double, iset: Double, direction: Direction): Double {
+        val baseStep = when {
             absErr > Tuning.V4 -> Tuning.HUGE_STEP_A
             absErr > Tuning.V3 -> Tuning.FAR_STEP_A
             absErr > Tuning.V2 -> Tuning.MID_STEP_A
             absErr > Tuning.V1 -> Tuning.NEAR_STEP_A
             else -> Tuning.FINE_STEP_A
+        }
+        val multiplier = ((iset.coerceAtLeast(0.0) / 10.0) * Tuning.ISET_STEP_MULTIPLIER_AT_10A)
+            .coerceAtLeast(1.0)
+        val scaled = baseStep * multiplier
+        return when (direction) {
+            Direction.Up -> scaled.coerceAtMost(Tuning.MAX_STEP_UP_A)
+            Direction.Down -> scaled.coerceAtMost(Tuning.MAX_STEP_DOWN_A)
         }
     }
 
@@ -298,10 +343,8 @@ class SolarMpptController(
         lastCollapseMs = now
         val step = (settings.kneeStepVolts * recentCollapseCount).coerceAtMost(maxCollapseStepVolts(settings))
         val previousOffset = kneeOffsetVolts
-        kneeOffsetVolts = (kneeOffsetVolts + step).coerceIn(
-            -settings.kneeVarianceVolts,
-            settings.kneeVarianceVolts
-        )
+        kneeOffsetVolts = clampKnee(settings, settings.targetPvVolts + kneeOffsetVolts + step) -
+            settings.targetPvVolts
         if (kneeOffsetVolts > previousOffset) {
             // Recovery just raised the learned knee, so give that safer point a full
             // tracking-delay window before the normal down-probe tries lower again.
@@ -310,10 +353,10 @@ class SolarMpptController(
     }
 
     private fun maxCollapseStepVolts(settings: AppSettings): Double {
-        // The full learned-knee window is target +/- variance. Divide that full span
+        // The full learned-knee window is min target PV through max target PV. Divide that full span
         // by six so worst-case repeated collapse can traverse the window in six bumps,
         // then round to tenths for predictable tuning.
-        val fullWindow = settings.kneeVarianceVolts * 2.0
+        val fullWindow = (highKneeLimit(settings) - lowKneeLimit(settings)).coerceAtLeast(0.0)
         return (round((fullWindow / 6.0) * 10.0) / 10.0).coerceAtLeast(settings.kneeStepVolts)
     }
 
@@ -438,8 +481,16 @@ class SolarMpptController(
     }
 
     private fun virtualKnee(settings: AppSettings): Double {
-        return quantVolts(settings.targetPvVolts + kneeOffsetVolts)
+        return quantVolts(clampKnee(settings, settings.targetPvVolts + kneeOffsetVolts))
     }
+
+    private fun clampKnee(settings: AppSettings, volts: Double): Double {
+        return volts.coerceIn(lowKneeLimit(settings), highKneeLimit(settings))
+    }
+
+    private fun lowKneeLimit(settings: AppSettings): Double = minOf(settings.minTargetPvVolts, settings.maxTargetPvVolts)
+
+    private fun highKneeLimit(settings: AppSettings): Double = maxOf(settings.minTargetPvVolts, settings.maxTargetPvVolts)
 
     private fun bandFor(vinError: Double): String {
         val absErr = abs(vinError)
@@ -500,6 +551,11 @@ class SolarMpptController(
         private const val PHASE_NONE = "--"
         private const val PHASE_WAIT_VIN = "Waiting VIN"
     }
+
+    private enum class Direction {
+        Up,
+        Down
+    }
 }
 
 /**
@@ -523,9 +579,12 @@ private object Tuning {
     const val V2 = 0.75 // Near/mid VIN error boundary in volts.
     const val V3 = 1.50 // Mid/far VIN error boundary in volts.
     const val V4 = 2.00 // Far/huge VIN error boundary in volts.
-    const val TRACK_DEADBAND_V = 0.05 // VIN error small enough to leave ISET unchanged this tick.
+    const val TRACK_DEADBAND_V = 0.02 // VIN error small enough to leave ISET unchanged this tick.
+    const val ISET_STEP_MULTIPLIER_AT_10A = 5.0 // Table-step multiplier at 10A ISET; scales linearly and never below 1x.
+    const val MAX_STEP_UP_A = 1.5 // Largest single upward ISET hunt step; limits Riden falloff risk.
+    const val MAX_STEP_DOWN_A = 10.0 // Largest single downward ISET hunt step; intentionally high for fast cloud unloading.
 
-    const val COLLAPSE_FLOOR_EXTRA_MARGIN_V = 2.0 // Collapse below target PV minus knee variance minus this cushion.
+    const val COLLAPSE_FLOOR_EXTRA_MARGIN_V = 2.0 // Collapse below the minimum target PV minus this cushion.
 
     const val RECOVERY_STABLE_ERR_V = 0.50 // VIN proximity to learned knee considered recovered enough for old ramp/verify paths.
     const val RECOVERY_DROP_FRACTION = 0.75 // Non-severe recovery current drop as a fraction of current ISET.

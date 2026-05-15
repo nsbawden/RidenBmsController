@@ -26,6 +26,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -60,7 +61,7 @@ import java.util.Locale
 fun HistoryScreen(state: AppState, modifier: Modifier = Modifier) {
     val clipboard = LocalClipboardManager.current
     val dayKeys = remember(state.history) { state.history.map { it.dayKey }.distinct().sortedDescending() }
-    var selectedDayKey by remember { mutableIntStateOf(dayKeys.firstOrNull() ?: 0) }
+    var selectedDayKey by rememberSaveable { mutableIntStateOf(dayKeys.firstOrNull() ?: 0) }
     LaunchedEffect(dayKeys) {
         if (selectedDayKey == 0 || (dayKeys.isNotEmpty() && selectedDayKey !in dayKeys)) {
             selectedDayKey = dayKeys.firstOrNull() ?: 0
@@ -134,8 +135,8 @@ private fun LineChart(
     unit: String,
     value: (HistoryPoint) -> Double
 ) {
-    var zoom by remember(title, points.firstOrNull()?.dayKey) { mutableFloatStateOf(1f) }
-    var panSamples by remember(title, points.firstOrNull()?.dayKey) { mutableFloatStateOf(0f) }
+    var zoom by rememberSaveable(title, points.firstOrNull()?.dayKey) { mutableFloatStateOf(1f) }
+    var panSamples by rememberSaveable(title, points.firstOrNull()?.dayKey) { mutableFloatStateOf(0f) }
     var chartWidthPx by remember(title, points.firstOrNull()?.dayKey) { mutableFloatStateOf(1f) }
 
     fun applyChartGesture(zoomChange: Float, panX: Float) {
@@ -270,8 +271,8 @@ private fun LineChart(
 private fun Double.formatAxis(unit: String): String {
     return when {
         unit == "%" -> "%.0f".format(this)
-        kotlin.math.abs(this) >= 100.0 -> "%.0f".format(this)
-        kotlin.math.abs(this) >= 10.0 -> "%.1f".format(this)
+        abs(this) >= 100.0 -> "%.0f".format(this)
+        abs(this) >= 10.0 -> "%.1f".format(this)
         else -> "%.2f".format(this)
     }
 }

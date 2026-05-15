@@ -2,6 +2,7 @@ package com.example.ridenbmscontroller.ui.screens
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,12 +17,24 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -32,6 +45,8 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
@@ -50,12 +65,15 @@ import com.example.ridenbmscontroller.ui.theme.WarningOrange
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.sin
+import androidx.compose.foundation.layout.offset
+
 
 @Composable
 fun DashboardScreen(
     state: AppState,
     modifier: Modifier = Modifier,
-    onSilenceLowSocAlarm: () -> Unit = {}
+    onSilenceLowSocAlarm: () -> Unit = {},
+    onSetActiveKnee: (Double) -> Unit = {}
 ) {
     Column(
         modifier = modifier
@@ -66,7 +84,7 @@ fun DashboardScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         BatteryGaugeCard(state, onSilenceLowSocAlarm)
-        RidenPanel(state)
+        RidenPanel(state, onSetActiveKnee)
         ControllerPanel(state)
     }
 }
@@ -129,6 +147,18 @@ private fun HalfCircleSocGauge(state: AppState) {
             .fillMaxWidth()
             .height(188.dp)
     ) {
+        if (state.batteryTimeEstimateText.isNotBlank()) {
+            Text(
+                text = state.batteryTimeEstimateText,
+                color = TextMuted,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold,
+                textAlign = TextAlign.End,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .offset(y = (-14).dp)
+            )
+        }
         Canvas(Modifier.fillMaxSize()) {
             val stroke = 24.dp.toPx()
             val width = size.width
@@ -278,7 +308,12 @@ private fun LowSocAlertRow(state: AppState, onSilenceLowSocAlarm: () -> Unit) {
 }
 
 @Composable
-private fun RidenPanel(state: AppState) {
+private fun RidenPanel(state: AppState, onSetActiveKnee: (Double) -> Unit) {
+    var targetPvDialogOpen by remember { mutableStateOf(false) }
+    fun closeTargetPvDialog() {
+        targetPvDialogOpen = false
+    }
+
     Surface(
         color = Panel,
         shape = RoundedCornerShape(8.dp),
@@ -307,7 +342,15 @@ private fun RidenPanel(state: AppState) {
                 )
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ValueTile("Target PV", "%.1f".format(state.riden.targetVin), "V", VoltageAmber, Modifier.weight(1f))
+                ValueTile(
+                    "Target PV",
+                    "%.1f".format(state.riden.targetVin),
+                    "V",
+                    VoltageAmber,
+                    Modifier
+                        .weight(1f)
+                        .clickable { targetPvDialogOpen = true }
+                )
                 ValueTile("VSET", "%.2f".format(state.riden.vset), "V", VoltageAmber, Modifier.weight(1f))
                 ValueTile("ISET", "%.2f".format(state.riden.iset), "A", CurrentRose, Modifier.weight(1f))
             }
@@ -326,6 +369,63 @@ private fun RidenPanel(state: AppState) {
             }
         }
     }
+
+    if (targetPvDialogOpen) {
+        TargetPvDialog(
+            onDismiss = { closeTargetPvDialog() },
+            onSet = {
+                onSetActiveKnee(it)
+                closeTargetPvDialog()
+            }
+        )
+    }
+}
+
+@Composable
+private fun TargetPvDialog(
+    onDismiss: () -> Unit,
+    onSet: (Double) -> Unit
+) {
+    var text by remember { mutableStateOf("") }
+    val focusRequester = remember { FocusRequester() }
+
+    fun commit() {
+        val value = text.toDoubleOrNull()?.coerceIn(10.0, 150.0) ?: return
+        onSet(value)
+    }
+
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Set Target PV") },
+        text = {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                singleLine = true,
+                label = { Text("Volts") },
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Decimal,
+                    imeAction = ImeAction.Done
+                ),
+                keyboardActions = KeyboardActions(onDone = { commit() }),
+                modifier = Modifier.focusRequester(focusRequester)
+            )
+        },
+        confirmButton = {
+            Button(onClick = { commit() }, enabled = text.toDoubleOrNull() != null) {
+                Text("Set")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
 }
 
 @Composable
