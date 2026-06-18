@@ -94,12 +94,13 @@ fun SettingsScreen(
             NumberFieldRow("Maximum charge current", settings.maxChargeAmps, "A", 0.1, 60.0) {
                 onSettingsChanged(settings.copy(maxChargeAmps = it))
             }
-            NumberFieldRow("Target PV voltage", settings.targetPvVolts, "V", 10.0, 150.0) {
+            NumberFieldRow("Target PV voltage", settings.targetPvVolts, "V", 10.0, 150.0) { newTarget ->
+                if (kotlin.math.abs(newTarget - settings.targetPvVolts) < 0.000_5) return@NumberFieldRow
                 onSettingsChanged(
                     settings.copy(
-                        targetPvVolts = it,
-                        minTargetPvVolts = settings.minTargetPvVolts.coerceAtMost(it),
-                        maxTargetPvVolts = settings.maxTargetPvVolts.coerceAtLeast(it)
+                        targetPvVolts = newTarget,
+                        minTargetPvVolts = settings.minTargetPvVolts.coerceAtMost(newTarget),
+                        maxTargetPvVolts = settings.maxTargetPvVolts.coerceAtLeast(newTarget)
                     )
                 )
                 onResetLearnedKnee()
@@ -115,6 +116,12 @@ fun SettingsScreen(
             }
             NumberFieldRow("Knee Tracking Delay", settings.kneeTrackingDelaySeconds, "s", 0.0, 300.0) {
                 onSettingsChanged(settings.copy(kneeTrackingDelaySeconds = it))
+            }
+            IntFieldRow("Fast acquire after", settings.fastAcquireSuccessCount, "stable probes", 1, 5) {
+                onSettingsChanged(settings.copy(fastAcquireSuccessCount = it))
+            }
+            ToggleRow("Power-based VTune stop", settings.powerBasedVtuneStop) {
+                onSettingsChanged(settings.copy(powerBasedVtuneStop = it))
             }
             IntFieldRow("Controller loop", settings.controllerLoopMs, "ms", 100, 2000) {
                 onSettingsChanged(settings.copy(controllerLoopMs = it))
@@ -186,7 +193,9 @@ private fun NumberFieldRow(
     fun commitText(currentText: String, fallback: Double) {
         val committed = currentText.toDoubleOrNull()?.coerceIn(min, max) ?: fallback
         text = committed.formatSetting()
-        latestOnValueChange(committed)
+        if (kotlin.math.abs(committed - latestValue) > 0.000_5) {
+            latestOnValueChange(committed)
+        }
     }
 
     LaunchedEffect(value, focused) {
@@ -196,7 +205,9 @@ private fun NumberFieldRow(
     DisposableEffect(label) {
         onDispose {
             val committed = latestText.toDoubleOrNull()?.coerceIn(min, max) ?: latestValue
-            latestOnValueChange(committed)
+            if (kotlin.math.abs(committed - latestValue) > 0.000_5) {
+                latestOnValueChange(committed)
+            }
         }
     }
 
@@ -260,7 +271,9 @@ private fun IntFieldRow(
     fun commitText(currentText: String, fallback: Int) {
         val committed = currentText.toIntOrNull()?.coerceIn(min, max) ?: fallback
         text = committed.toString()
-        latestOnValueChange(committed)
+        if (committed != latestValue) {
+            latestOnValueChange(committed)
+        }
     }
 
     LaunchedEffect(value, focused) {
@@ -270,7 +283,9 @@ private fun IntFieldRow(
     DisposableEffect(label) {
         onDispose {
             val committed = latestText.toIntOrNull()?.coerceIn(min, max) ?: latestValue
-            latestOnValueChange(committed)
+            if (committed != latestValue) {
+                latestOnValueChange(committed)
+            }
         }
     }
 

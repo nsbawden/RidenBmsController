@@ -24,7 +24,13 @@ data class MpptControlState(
     val controlStepAmps: Double = 0.0,
     val chargeVoltageTarget: Double = 0.0,
     val recoveryActive: Boolean = false,
-    val socTargetPercent: Int = 0
+    val socTargetPercent: Int = 0,
+    val kneeProbeFast: Boolean = false,
+    val vtuneProbePhase: String = "--",
+    val huntLockTicks: Int = 0,
+    val estimatedPinWatts: Double = 0.0,
+    val acceptedProbePinWatts: Double = 0.0,
+    val vtuneDescentBlocked: Boolean = false
 )
 
 /**
@@ -42,7 +48,8 @@ class SolarMpptController(
     private val setVset: (Double) -> Unit,
     private val setIset: (Double) -> Unit,
     private val onBalanceDayStarted: (Long) -> Unit,
-    private val onState: (MpptControlState) -> Unit
+    private val onState: (MpptControlState) -> Unit,
+    private val onEvent: (String) -> Unit = {}
 ) {
     private var outputEnabled = false
     private var commandIset = 0.0
@@ -61,6 +68,21 @@ class SolarMpptController(
     private var alarmHoldUntilMs = 0L
     private var alarmBackoffMs = Tuning.ALARM_BASE_HOLD_MS
     private var lastAlarmStartMs = 0L
+    private var pendingVtuneDownProbe = false
+    private var lastVtuneDownProbeMs = 0L
+    private var kneeProbeFast = false
+    private var maintenanceDownshiftSuccessCount = 0
+    private var watchingMaintenanceDownshiftStability = false
+    private var lastMaintenanceDownProbeMs = 0L
+    private var maintenancePinBeforeProbeW = 0.0
+    private var probePacingPhase = ProbePacingPhase.IDLE
+    private var huntLockConsecutiveTicks = 0
+    private var probeWaitSinceMs = 0L
+    private var probePauseUntilMs = 0L
+    private var awaitingPowerCheck = false
+    private var acceptedProbeInputPowerW = 0.0
+    private var vtuneDescentBlocked = false
+    private var lastEstimatedPinW = 0.0
 
     fun resetLearnedKnee() {
         kneeOffsetVolts = 0.0
@@ -68,6 +90,7 @@ class SolarMpptController(
         recentCollapseCount = 0
         lastCollapseMs = 0L
         stableSinceMs = 0L
+        resetFastAcquireState()
     }
 
     fun setActiveKnee(settings: AppSettings, targetPvVolts: Double) {
@@ -76,6 +99,29 @@ class SolarMpptController(
         recentCollapseCount = 0
         lastCollapseMs = 0L
         stableSinceMs = 0L
+        resetFastAcquireState()
+    }
+
+    private fun resetFastAcquireState() {
+        pendingVtuneDownProbe = false
+        kneeProbeFast = false
+        maintenanceDownshiftSuccessCount = 0
+        watchingMaintenanceDownshiftStability = false
+        lastMaintenanceDownProbeMs = 0L
+        maintenancePinBeforeProbeW = 0.0
+        resetProbePacingState(clearPowerBaseline = true)
+    }
+
+    private fun resetProbePacingState(clearPowerBaseline: Boolean) {
+        probePacingPhase = ProbePacingPhase.IDLE
+        huntLockConsecutiveTicks = 0
+        probeWaitSinceMs = 0L
+        probePauseUntilMs = 0L
+        awaitingPowerCheck = false
+        if (clearPowerBaseline) {
+            acceptedProbeInputPowerW = 0.0
+            vtuneDescentBlocked = false
+        }
     }
 
     fun tick(
@@ -150,8 +196,8 @@ class SolarMpptController(
 
         val oldIset = currentIset(riden.iset)
         val nextIset = when {
-            recoveryPhase != PHASE_NONE -> recover(settings, oldIset, vin, virtualKnee)
-            isCollapsed(settings, vin) -> enterRecovery(settings, oldIset, currentLimit, vin)
+            recoveryPhase != PHASE_NONE -> recover(settings, oldIset, vin, vout, riden.watts ?: 0.0, virtualKnee)
+            isCollapsed(settings, vin) -> enterRecovery(settings, oldIset, currentLimit, vin, now)
             socPercent >= socTarget || voltageLimited -> {
                 pvMode = if (balanceDay) MODE_BALANCE else if (socPercent >= socTarget) MODE_SOC_HOLD else MODE_VOLTAGE_LIMIT
                 recoveryPhase = PHASE_NONE
@@ -159,13 +205,14 @@ class SolarMpptController(
                 holdBatteryCurrentAtSolarKnee(oldIset, batteryAmps, targetBatteryCurrent, vin, virtualKnee)
                     .coerceAtMost(currentLimit)
             }
-            else -> trackSolarKnee(settings, oldIset, vin, virtualKnee, now)
+            else -> trackSolarKnee(settings, oldIset, vin, vout, riden.watts ?: 0.0, virtualKnee, now)
         }.coerceIn(Tuning.MIN_ISET, currentLimit)
 
         commandIset = quantAmps(nextIset)
         setIset(commandIset)
 
         val finalVinError = vin - virtualKnee(settings)
+        lastEstimatedPinW = estimateInputPowerW(riden.watts ?: 0.0, vin, vout)
         publish(
             settings = settings,
             status = statusFor(balanceDay, socPercent >= socTarget, voltageLimited),
@@ -177,10 +224,17 @@ class SolarMpptController(
         )
     }
 
+    private fun estimateInputPowerW(outputWatts: Double, vin: Double, vout: Double): Double {
+        if (outputWatts <= 0.0 || vin <= 0.0 || vout <= 0.0) return 0.0
+        return outputWatts * (vin / vout)
+    }
+
     private fun trackSolarKnee(
         settings: AppSettings,
         oldIset: Double,
         vin: Double,
+        vout: Double,
+        outputWatts: Double,
         virtualKnee: Double,
         now: Long
     ): Double {
@@ -201,24 +255,221 @@ class SolarMpptController(
             lastWorkingIset = max(lastWorkingIset * 0.8 + oldIset * 0.2, Tuning.MIN_ISET)
         }
         updateStableRecoveryReset(true, settings, vin, virtualKnee, now)
+        val inputPowerW = estimateInputPowerW(outputWatts, vin, vout)
+        if (!settings.powerBasedVtuneStop && vtuneDescentBlocked) {
+            vtuneDescentBlocked = false
+            if (probePacingPhase == ProbePacingPhase.BLOCKED) {
+                probePacingPhase = ProbePacingPhase.IDLE
+            }
+        }
+        updateProbePacing(settings, vin, virtualKnee, inputPowerW, now)
+        updateMaintenanceDownshiftStability(settings, inputPowerW, now)
 
         // Periodically try a lower virtual knee. If that asks too much of the panels,
         // collapse recovery will raise the knee back up.
-        if (now - lastKneeProbeMs >= (settings.kneeTrackingDelaySeconds * 1000.0).toLong()) {
-            lastKneeProbeMs = now
-            kneeOffsetVolts = clampKnee(settings, settings.targetPvVolts + kneeOffsetVolts - settings.kneeStepVolts) -
-                settings.targetPvVolts
-        }
+        maybeVtuneDownProbe(settings, inputPowerW, now)
 
         return next
+    }
+
+    private fun updateProbePacing(
+        settings: AppSettings,
+        vin: Double,
+        virtualKnee: Double,
+        inputPowerW: Double,
+        now: Long
+    ) {
+        when (probePacingPhase) {
+            ProbePacingPhase.WAIT_HUNT_LOCK -> {
+                if (abs(vin - virtualKnee) <= Tuning.TRACK_DEADBAND_V) {
+                    huntLockConsecutiveTicks += 1
+                } else {
+                    huntLockConsecutiveTicks = 0
+                }
+                val locked = huntLockConsecutiveTicks >= Tuning.HUNT_LOCK_TICKS
+                val timedOut = now - probeWaitSinceMs >= Tuning.MAX_HUNT_LOCK_WAIT_MS
+                if (locked || timedOut) {
+                    probePacingPhase = ProbePacingPhase.PAUSE
+                    probePauseUntilMs = now + Tuning.ACQUISITION_PAUSE_MS
+                    huntLockConsecutiveTicks = 0
+                }
+            }
+            ProbePacingPhase.PAUSE -> {
+                if (now >= probePauseUntilMs) {
+                    if (awaitingPowerCheck) {
+                        evaluateProbePower(settings, inputPowerW)
+                        awaitingPowerCheck = false
+                    }
+                    probePacingPhase = ProbePacingPhase.IDLE
+                }
+            }
+            ProbePacingPhase.IDLE, ProbePacingPhase.BLOCKED -> Unit
+        }
+    }
+
+    private fun updateMaintenanceDownshiftStability(
+        settings: AppSettings,
+        inputPowerW: Double,
+        now: Long
+    ) {
+        if (!watchingMaintenanceDownshiftStability || kneeProbeFast) return
+        if (now - lastMaintenanceDownProbeMs < Tuning.MAINTENANCE_DOWNSHIFT_STABLE_MS) return
+
+        watchingMaintenanceDownshiftStability = false
+        if (settings.powerBasedVtuneStop &&
+            powerDroppedAfterProbe(inputPowerW, maintenancePinBeforeProbeW)
+        ) {
+            revertLastVtuneStep(settings, now)
+            maintenanceDownshiftSuccessCount = 0
+            onEvent(
+                "VTune maintenance power stop: Pin ${"%.0f".format(inputPowerW)}W < baseline " +
+                    "${"%.0f".format(maintenancePinBeforeProbeW)}W, reverted"
+            )
+            return
+        }
+
+        maintenanceDownshiftSuccessCount += 1
+        val required = settings.fastAcquireSuccessCount.coerceIn(1, 5)
+        if (maintenanceDownshiftSuccessCount >= required) {
+            maintenanceDownshiftSuccessCount = 0
+            startFastAcquire(inputPowerW)
+        }
+    }
+
+    private fun startFastAcquire(inputPowerW: Double) {
+        kneeProbeFast = true
+        vtuneDescentBlocked = false
+        resetProbePacingState(clearPowerBaseline = true)
+        if (inputPowerW > 0.0) {
+            acceptedProbeInputPowerW = inputPowerW
+        }
+        probePacingPhase = ProbePacingPhase.IDLE
+    }
+
+    private fun maybeVtuneDownProbe(settings: AppSettings, inputPowerW: Double, now: Long) {
+        if (vtuneDescentBlocked) return
+
+        if (kneeProbeFast) {
+            if (probePacingPhase != ProbePacingPhase.IDLE) return
+            if (now - lastKneeProbeMs < Tuning.MIN_FAST_PROBE_SPACING_MS) return
+            executeVtuneDownProbe(settings, inputPowerW, now, fastAcquire = true)
+            return
+        }
+
+        if (now - lastKneeProbeMs < maintenanceProbeDelayMs(settings)) return
+        executeVtuneDownProbe(settings, inputPowerW, now, fastAcquire = false)
+    }
+
+    private fun executeVtuneDownProbe(
+        settings: AppSettings,
+        inputPowerW: Double,
+        now: Long,
+        fastAcquire: Boolean
+    ) {
+        lastKneeProbeMs = now
+        lastVtuneDownProbeMs = now
+        pendingVtuneDownProbe = true
+        kneeOffsetVolts = clampKnee(settings, settings.targetPvVolts + kneeOffsetVolts - settings.kneeStepVolts) -
+            settings.targetPvVolts
+
+        probePacingPhase = ProbePacingPhase.WAIT_HUNT_LOCK
+        probeWaitSinceMs = now
+        huntLockConsecutiveTicks = 0
+        awaitingPowerCheck = true
+
+        if (fastAcquire) {
+            return
+        }
+
+        watchingMaintenanceDownshiftStability = true
+        lastMaintenanceDownProbeMs = now
+        maintenancePinBeforeProbeW = inputPowerW.coerceAtLeast(0.0)
+    }
+
+    private fun evaluateProbePower(settings: AppSettings, inputPowerW: Double) {
+        if (inputPowerW <= 0.0) return
+        if (!settings.powerBasedVtuneStop) {
+            if (acceptedProbeInputPowerW <= 0.0) {
+                acceptedProbeInputPowerW = inputPowerW
+            } else {
+                acceptedProbeInputPowerW = acceptedProbeInputPowerW * 0.5 + inputPowerW * 0.5
+            }
+            return
+        }
+        if (acceptedProbeInputPowerW <= 0.0) {
+            acceptedProbeInputPowerW = inputPowerW
+            return
+        }
+        if (powerDroppedAfterProbe(inputPowerW, acceptedProbeInputPowerW)) {
+            val baseline = acceptedProbeInputPowerW
+            revertLastVtuneStep(settings, System.currentTimeMillis())
+            vtuneDescentBlocked = true
+            probePacingPhase = ProbePacingPhase.BLOCKED
+            if (kneeProbeFast) {
+                kneeProbeFast = false
+            }
+            onEvent(
+                "VTune power stop: Pin ${"%.0f".format(inputPowerW)}W < baseline " +
+                    "${"%.0f".format(baseline)}W, reverted"
+            )
+            return
+        }
+        acceptedProbeInputPowerW = acceptedProbeInputPowerW * 0.5 + inputPowerW * 0.5
+    }
+
+    private fun powerDroppedAfterProbe(currentPinW: Double, baselinePinW: Double): Boolean {
+        if (currentPinW <= 0.0 || baselinePinW <= 0.0) return false
+        val epsilon = max(
+            Tuning.POWER_PROBE_MIN_EPS_W,
+            baselinePinW * Tuning.POWER_PROBE_EPS_FRACTION
+        )
+        return currentPinW < baselinePinW - epsilon
+    }
+
+    private fun revertLastVtuneStep(settings: AppSettings, now: Long) {
+        kneeOffsetVolts = clampKnee(settings, settings.targetPvVolts + kneeOffsetVolts + settings.kneeStepVolts) -
+            settings.targetPvVolts
+        lastKneeProbeMs = now
+        pendingVtuneDownProbe = false
+        awaitingPowerCheck = false
+        probePacingPhase = ProbePacingPhase.IDLE
+    }
+
+    private fun maintenanceProbeDelayMs(settings: AppSettings): Long {
+        return (settings.kneeTrackingDelaySeconds * 1000.0).toLong()
+    }
+
+    private fun expectedProbeCollapseWindowMs(settings: AppSettings): Long {
+        val cycleMs = if (kneeProbeFast) {
+            Tuning.ACQUISITION_MAX_PROBE_CYCLE_MS
+        } else {
+            maintenanceProbeDelayMs(settings)
+        }
+        return cycleMs + Tuning.EXPECTED_PROBE_COLLAPSE_EXTRA_MS
     }
 
     private fun enterRecovery(
         settings: AppSettings,
         oldIset: Double,
         policyLimit: Double,
-        vin: Double
+        vin: Double,
+        now: Long
     ): Double {
+        val probeCausedRecovery = pendingVtuneDownProbe &&
+            (now - lastVtuneDownProbeMs) <= expectedProbeCollapseWindowMs(settings)
+        pendingVtuneDownProbe = false
+        watchingMaintenanceDownshiftStability = false
+        maintenancePinBeforeProbeW = 0.0
+        resetProbePacingState(clearPowerBaseline = false)
+        vtuneDescentBlocked = false
+
+        if (kneeProbeFast && probeCausedRecovery) {
+            kneeProbeFast = false
+            maintenanceDownshiftSuccessCount = 0
+        } else {
+            maintenanceDownshiftSuccessCount = 0
+        }
+
         lastWorkingIset = max(oldIset, commandIset).coerceAtLeast(Tuning.MIN_ISET)
         recoveryPhase = PHASE_WAIT_VIN
         pvMode = MODE_RECOVER
@@ -236,6 +487,8 @@ class SolarMpptController(
         settings: AppSettings,
         oldIset: Double,
         vin: Double,
+        vout: Double,
+        outputWatts: Double,
         virtualKnee: Double
     ): Double {
         pvMode = MODE_RECOVER
@@ -262,7 +515,15 @@ class SolarMpptController(
                 // again, normal tracking owns the search for the best current.
                 recoveryPhase = PHASE_NONE
                 pvMode = MODE_TRACKING
-                trackSolarKnee(settings, oldIset, vin, virtualKnee, System.currentTimeMillis())
+                trackSolarKnee(
+                    settings,
+                    oldIset,
+                    vin,
+                    vout,
+                    outputWatts,
+                    virtualKnee,
+                    System.currentTimeMillis()
+                )
             }
         }
     }
@@ -349,6 +610,8 @@ class SolarMpptController(
             // Recovery just raised the learned knee, so give that safer point a full
             // tracking-delay window before the normal down-probe tries lower again.
             lastKneeProbeMs = now
+            vtuneDescentBlocked = false
+            probePacingPhase = ProbePacingPhase.IDLE
         }
     }
 
@@ -405,7 +668,7 @@ class SolarMpptController(
             balanceDay -> "Balance day: SOC target 100%"
             socReached -> "SOC ceiling reached: load support"
             voltageLimited -> "Controller voltage limit"
-            else -> "Tracking solar knee"
+            else -> "Tracking solar knee" + if (kneeProbeFast) " (fast acquire)" else ""
         }
     }
 
@@ -434,6 +697,7 @@ class SolarMpptController(
         recoveryCycleCount = 0
         recentCollapseCount = 0
         stableSinceMs = 0L
+        resetFastAcquireState()
         pvMode = MODE_IDLE
         publish(settings, status, 0.0, "--")
     }
@@ -531,7 +795,13 @@ class SolarMpptController(
                 controlStepAmps = stepAmps,
                 chargeVoltageTarget = lastVset,
                 recoveryActive = pvMode == MODE_RECOVER,
-                socTargetPercent = socTargetPercent
+                socTargetPercent = socTargetPercent,
+                kneeProbeFast = kneeProbeFast,
+                vtuneProbePhase = probePacingPhase.label,
+                huntLockTicks = huntLockConsecutiveTicks,
+                estimatedPinWatts = lastEstimatedPinW,
+                acceptedProbePinWatts = acceptedProbeInputPowerW,
+                vtuneDescentBlocked = vtuneDescentBlocked
             )
         )
     }
@@ -556,6 +826,13 @@ class SolarMpptController(
         Up,
         Down
     }
+
+    private enum class ProbePacingPhase(val label: String) {
+        IDLE("--"),
+        WAIT_HUNT_LOCK("WaitLock"),
+        PAUSE("Pause"),
+        BLOCKED("Blocked")
+    }
 }
 
 /**
@@ -571,10 +848,10 @@ private object Tuning {
     const val MIN_ISET = 0.01 // Lowest Riden current request used for weak sun and collapse recovery.
 
     const val FINE_STEP_A = 0.01 // ISET change when VIN is within V1 of the learned knee.
-    const val NEAR_STEP_A = 0.05 // ISET change when VIN error is between V1 and V2.
-    const val MID_STEP_A = 0.10 // ISET change when VIN error is between V2 and V3.
-    const val FAR_STEP_A = 0.30 // ISET change when VIN error is between V3 and V4.
-    const val HUGE_STEP_A = 1.00 // ISET change when VIN error is larger than V4.
+    const val NEAR_STEP_A = 0.02 // ISET change when VIN error is between V1 and V2.
+    const val MID_STEP_A = 0.05 // ISET change when VIN error is between V2 and V3.
+    const val FAR_STEP_A = 0.10 // ISET change when VIN error is between V3 and V4.
+    const val HUGE_STEP_A = 0.50 // ISET change when VIN error is larger than V4.
     const val V1 = 0.25 // Fine/near VIN error boundary in volts.
     const val V2 = 0.75 // Near/mid VIN error boundary in volts.
     const val V3 = 1.50 // Mid/far VIN error boundary in volts.
@@ -599,4 +876,14 @@ private object Tuning {
     const val ALARM_MAX_HOLD_MS = 30 * 60_000L // Longest retry delay after repeated BMS alarms.
     const val ALARM_REPEAT_WINDOW_MS = 10 * 60_000L // Alarm recurrences inside this window increase backoff.
     const val ALARM_STABLE_RESET_MS = 30 * 60_000L // Stable time before alarm backoff resets to the base delay.
+
+    const val ACQUISITION_PAUSE_MS = 500L // Soak after hunt lock before next fast-acquire probe or power check.
+    const val HUNT_LOCK_TICKS = 3 // Consecutive in-deadband ticks before hunt is considered locked.
+    const val MAX_HUNT_LOCK_WAIT_MS = 5_000L // Force pause if hunt has not locked by this time.
+    const val MIN_FAST_PROBE_SPACING_MS = 200L // Minimum spacing between fast-acquire down-probes.
+    const val ACQUISITION_MAX_PROBE_CYCLE_MS = 8_000L // Upper bound for probe-caused recovery window timing.
+    const val EXPECTED_PROBE_COLLAPSE_EXTRA_MS = 12_000L // Grace after a down-probe before collapse counts as probe-caused.
+    const val MAINTENANCE_DOWNSHIFT_STABLE_MS = 5_000L // Stable time after maintenance down-probe with no recovery.
+    const val POWER_PROBE_MIN_EPS_W = 6.0 // Minimum Pin drop to treat a down-probe as past MPP.
+    const val POWER_PROBE_EPS_FRACTION = 0.05 // Relative Pin drop threshold for power-based stop.
 }

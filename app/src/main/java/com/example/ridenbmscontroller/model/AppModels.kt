@@ -1,5 +1,6 @@
 package com.example.ridenbmscontroller.model
 
+import com.example.ridenbmscontroller.logging.OpsLogStorageSummary
 enum class PowerDirection {
     Charging,
     Discharging,
@@ -45,36 +46,6 @@ data class EnergyCounters(
     val bmsWhYesterday: Double
 )
 
-data class KneeLearningBin(
-    val index: Int,
-    val minIset: Double,
-    val maxIset: Double,
-    val learnedKneeVolts: Double?,
-    val confidence: Double,
-    val sampleCount: Int,
-    val stableSeconds: Double = 0.0,
-    val currentStableRunSeconds: Double = 0.0,
-    val longestStableRunSeconds: Double = 0.0,
-    val candidateKneeVolts: Double? = null,
-    val candidateStableSeconds: Double = 0.0,
-    val highestStableKneeVolts: Double? = null,
-    val highStableSeconds: Double = 0.0,
-    val highCurrentStableRunSeconds: Double = 0.0,
-    val highLongestStableRunSeconds: Double = 0.0,
-    val candidateHighKneeVolts: Double? = null,
-    val candidateHighStableSeconds: Double = 0.0,
-    val bestWatts: Double,
-    val lastIset: Double,
-    val lastIout: Double,
-    val lastWatts: Double,
-    val lastVinError: Double,
-    val lastTemperatureF: Double? = null,
-    val minTemperatureF: Double? = null,
-    val maxTemperatureF: Double? = null,
-    val lastUpdatedMs: Long,
-    val manual: Boolean
-)
-
 data class ControllerState(
     val enabled: Boolean,
     val pvMode: String,
@@ -117,6 +88,8 @@ data class AppSettings(
     val maxTargetPvVolts: Double,
     val kneeStepVolts: Double,
     val kneeTrackingDelaySeconds: Double,
+    val fastAcquireSuccessCount: Int,
+    val powerBasedVtuneStop: Boolean,
     val controllerLoopMs: Int,
     val keepScreenOn: Boolean
 )
@@ -145,7 +118,7 @@ data class AppState(
     val history: List<HistoryPoint>,
     val events: List<String>,
     val logs: List<String>,
-    val kneeLearningBins: List<KneeLearningBin>,
+    val opsLogSummary: OpsLogStorageSummary,
     val batteryTimeEstimateText: String
 ) {
     companion object {
@@ -220,13 +193,19 @@ data class AppState(
                 maxTargetPvVolts = 36.0,
                 kneeStepVolts = 0.10,
                 kneeTrackingDelaySeconds = 12.0,
+                fastAcquireSuccessCount = 2,
+                powerBasedVtuneStop = false,
                 controllerLoopMs = 200,
                 keepScreenOn = true
             ),
             history = emptyList(),
             events = emptyList(),
             logs = emptyList(),
-            kneeLearningBins = emptyList(),
+            opsLogSummary = OpsLogStorageSummary(
+                totalBytes = 0L,
+                days = emptyList(),
+                logDirectory = ""
+            ),
             batteryTimeEstimateText = ""
         )
     }

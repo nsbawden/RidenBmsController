@@ -10,7 +10,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.core.content.edit
 import androidx.lifecycle.lifecycleScope
-import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -44,7 +45,9 @@ import com.example.ridenbmscontroller.model.ChargeMode
 import com.example.ridenbmscontroller.model.ControllerState
 import com.example.ridenbmscontroller.model.EnergyCounters
 import com.example.ridenbmscontroller.model.HistoryPoint
-import com.example.ridenbmscontroller.model.KneeLearningBin
+import com.example.ridenbmscontroller.logging.OpsLogger
+import com.example.ridenbmscontroller.logging.OpsLogStorageSummary
+import com.example.ridenbmscontroller.logging.OpsTelemetrySample
 import com.example.ridenbmscontroller.model.PowerDirection
 import com.example.ridenbmscontroller.model.RidenState
 import com.example.ridenbmscontroller.riden.RidenUsbMonitor
@@ -61,14 +64,11 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 import kotlin.math.abs
-import kotlin.math.min
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import org.json.JSONArray
-import org.json.JSONException
-import org.json.JSONObject
+import androidx.compose.foundation.layout.padding
 
 class MainActivity : ComponentActivity() {
     private lateinit var bmsBleScanner: BmsBleScanner
@@ -93,8 +93,22 @@ class MainActivity : ComponentActivity() {
     private var lastControllerEventSignature = ""
     private var lastHistorySampleMs = 0L
     private var lastHistoryPruneMs = 0L
-    private var lastKneeLearningSampleMs = 0L
-    private var kneeLearningBins by mutableStateOf(defaultKneeLearningBins())
+    private var lastOpsSampleMs = 0L
+    private var lastOpsStorageCheckMs = 0L
+    private var opsLogSummary by mutableStateOf(OpsLogStorageSummary(0L, emptyList(), ""))
+    private var logStorageWarning by mutableStateOf<String?>(null)
+    private var logStorageWarningDismissed = false
+    private var lastLoggedKneeOffset = Double.NaN
+    private var lastLoggedRecoveryCycle = -1
+    private var lastLoggedRecoveryPhase = ""
+    private var lastOpsTelemetryBand = ""
+    private var lastOpsTelemetryPvMode = ""
+    private var opsBurstLogging = false
+    private var opsBurstStableSinceMs = 0L
+    private var lastLoggedKneeProbeFast = false
+    private var lastLoggedVtuneProbePhase = "--"
+    private var lastLoggedVtuneDescentBlocked = false
+    private lateinit var opsLogger: OpsLogger
     private var batteryCurrentAverage = RollingAverageWindow(60_000L)
     private var historyAccumulator = HistoryAccumulator()
     private var hadGoodRidenConnection = false
@@ -114,7 +128,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         appSettings = loadSettings()
-        kneeLearningBins = loadKneeLearningBins()
+        opsLogger = OpsLogger(filesDir)
+        refreshOpsLogSummary()
+        opsLogger.logEvent(System.currentTimeMillis(), "App started")
         loadEnergy()
         historyPoints = loadHistory()
         lastHistorySampleMs = System.currentTimeMillis()
@@ -125,7 +141,8 @@ class MainActivity : ComponentActivity() {
             setVset = { ridenUsbMonitor.setVset(it) },
             setIset = { ridenUsbMonitor.setIset(it) },
             onBalanceDayStarted = { markBalanceDayStarted(it) },
-            onState = { handleMpptControlState(it) }
+            onState = { handleMpptControlState(it) },
+            onEvent = { addControllerEvent(it) }
         )
         bmsBleScanner = BmsBleScanner(this) {
             bmsBleState = it
@@ -134,6 +151,7 @@ class MainActivity : ComponentActivity() {
             historyAccumulator.addBms(it)
             updateBmsEnergyFromPower(it.telemetry.packVoltage, it.telemetry.packCurrent)
             maybeRecordHistory()
+            maybeRecordOpsTelemetry()
             updateLowSocAlarm()
             tickController()
         }
@@ -142,6 +160,7 @@ class MainActivity : ComponentActivity() {
             historyAccumulator.addRiden(it)
             updateEnergyFromPower(it.telemetry.watts)
             maybeRecordHistory()
+            maybeRecordOpsTelemetry()
             updateUsbAlarm(it.connected)
             tickController()
         }
@@ -158,15 +177,28 @@ class MainActivity : ComponentActivity() {
                     historyPoints = historyPoints,
                     controllerEvents = controllerEvents,
                     alertState = alertState,
-                    kneeLearningBins = kneeLearningBins,
+                    opsLogSummary = opsLogSummary,
+                    logStorageWarning = logStorageWarning,
                     batteryTimeEstimateText = batteryTimeEstimateText,
                     onSettingsChanged = {
-                        appSettings = it
-                        saveSettings(it)
-                        applyKeepScreenOn(it.keepScreenOn)
-                        applyControllerKeepAlive(it.controllerEnabled)
-                        updateLowSocAlarm()
-                        tickController()
+                        val previous = appSettings
+                        if (it != previous) {
+                            appSettings = it
+                            saveSettings(it)
+                            if (it.powerBasedVtuneStop != previous.powerBasedVtuneStop) {
+                                addControllerEvent(
+                                    if (it.powerBasedVtuneStop) {
+                                        "Power-based VTune stop enabled"
+                                    } else {
+                                        "Power-based VTune stop disabled (collapse only)"
+                                    }
+                                )
+                            }
+                            applyKeepScreenOn(it.keepScreenOn)
+                            applyControllerKeepAlive(it.controllerEnabled)
+                            updateLowSocAlarm()
+                            tickController()
+                        }
                     },
                     onRequestBlePermissions = {
                         requestBlePermissions.launch(bmsBleScanner.requiredPermissions())
@@ -187,8 +219,12 @@ class MainActivity : ComponentActivity() {
                         mpptController.setActiveKnee(appSettings, volts)
                         tickController()
                     },
-                    onSaveDebugSnapshot = { json -> saveDebugSnapshot(json) },
-                    onImportKneeData = { json -> importKneeLearningData(json) },
+                    onDeleteOpsLogsBeforeDate = { cutoff -> deleteOpsLogsBeforeDate(cutoff) },
+                    onRefreshOpsLogSummary = { refreshOpsLogSummary() },
+                    onDismissLogStorageWarning = {
+                        logStorageWarningDismissed = true
+                        logStorageWarning = null
+                    },
                     onSilenceLowSocAlarm = { silenceLowSocAlarm() }
                 )
             }
@@ -326,7 +362,9 @@ class MainActivity : ComponentActivity() {
         val previous = mpptControlState
         mpptControlState = state
         updateBatteryTimeEstimate()
-        maybeLearnKneePoint(state)
+        logControllerTransitions(previous, state)
+        updateOpsBurstLogging(state)
+        maybeRecordOpsTelemetry()
 
         val signature = listOf(
             state.enabled,
@@ -350,9 +388,126 @@ class MainActivity : ComponentActivity() {
         addControllerEvent("${state.pvMode}: ${state.status}")
     }
 
+    private fun logControllerTransitions(previous: MpptControlState, state: MpptControlState) {
+        var forceTelemetry = false
+
+        if (state.recoveryActive && !previous.recoveryActive) {
+            opsBurstLogging = true
+            opsBurstStableSinceMs = 0L
+            addControllerEvent("Recovery entered: ${state.status}")
+            forceTelemetry = true
+        }
+        if (state.controlBand != lastOpsTelemetryBand && lastOpsTelemetryBand.isNotEmpty()) {
+            addControllerEvent("Control band ${lastOpsTelemetryBand} -> ${state.controlBand}")
+            forceTelemetry = true
+        }
+        if (state.kneeProbeFast != lastLoggedKneeProbeFast) {
+            if (state.kneeProbeFast) {
+                addControllerEvent("VTune fast acquire started")
+            } else {
+                addControllerEvent("VTune fast acquire ended")
+            }
+            lastLoggedKneeProbeFast = state.kneeProbeFast
+            forceTelemetry = true
+        }
+        if (state.vtuneProbePhase != lastLoggedVtuneProbePhase && state.vtuneProbePhase != "--") {
+            addControllerEvent("VTune probe phase: $lastLoggedVtuneProbePhase -> ${state.vtuneProbePhase}")
+            lastLoggedVtuneProbePhase = state.vtuneProbePhase
+            forceTelemetry = true
+        } else if (state.vtuneProbePhase == "--" && lastLoggedVtuneProbePhase != "--") {
+            lastLoggedVtuneProbePhase = "--"
+        }
+        if (state.vtuneDescentBlocked != lastLoggedVtuneDescentBlocked) {
+            if (state.vtuneDescentBlocked) {
+                addControllerEvent("VTune descent blocked (power limit)")
+            } else {
+                addControllerEvent("VTune descent unblocked")
+            }
+            lastLoggedVtuneDescentBlocked = state.vtuneDescentBlocked
+            forceTelemetry = true
+        }
+        if (state.kneeOffsetVolts != lastLoggedKneeOffset) {
+            if (!lastLoggedKneeOffset.isNaN()) {
+                val delta = state.kneeOffsetVolts - lastLoggedKneeOffset
+                if (delta < -OPS_KNEE_DOWN_EPS_V) {
+                    opsBurstLogging = true
+                    opsBurstStableSinceMs = 0L
+                    addControllerEvent(
+                        "VTune down probe ${"%+.2f".format(delta)}V -> ${"%.2f".format(state.targetPvVolts)}V target"
+                    )
+                } else {
+                    addControllerEvent(
+                        "Knee offset ${"%+.2f".format(delta)}V -> ${"%.2f".format(state.targetPvVolts)}V target"
+                    )
+                }
+                forceTelemetry = true
+            }
+            lastLoggedKneeOffset = state.kneeOffsetVolts
+        }
+        if (state.recoveryCycleCount != lastLoggedRecoveryCycle && state.recoveryCycleCount > 0) {
+            addControllerEvent("Recovery cycle ${state.recoveryCycleCount}")
+            forceTelemetry = true
+            lastLoggedRecoveryCycle = state.recoveryCycleCount
+        }
+        if (state.recoveryPhase != lastLoggedRecoveryPhase &&
+            state.recoveryPhase != "--" &&
+            previous.recoveryPhase != state.recoveryPhase
+        ) {
+            addControllerEvent("Recovery phase: ${state.recoveryPhase}")
+            forceTelemetry = true
+            lastLoggedRecoveryPhase = state.recoveryPhase
+        }
+        if (!state.recoveryActive && previous.recoveryActive) {
+            addControllerEvent("Recovery cleared")
+            forceTelemetry = true
+            lastLoggedRecoveryCycle = state.recoveryCycleCount
+        }
+        if (forceTelemetry) {
+            maybeRecordOpsTelemetry(force = true)
+        }
+    }
+
+    private fun updateOpsBurstLogging(control: MpptControlState) {
+        if (control.recoveryActive || control.pvMode == "Recover") {
+            opsBurstLogging = true
+            opsBurstStableSinceMs = 0L
+            return
+        }
+        if (control.kneeProbeFast || control.vtuneProbePhase == "WaitLock" || control.vtuneProbePhase == "Pause") {
+            opsBurstLogging = true
+            opsBurstStableSinceMs = 0L
+            return
+        }
+        if (!opsBurstLogging) return
+
+        if (isOpsTrackingStable(control)) {
+            val now = System.currentTimeMillis()
+            if (opsBurstStableSinceMs == 0L) opsBurstStableSinceMs = now
+            if (now - opsBurstStableSinceMs >= OPS_BURST_STABLE_CLEAR_MS) {
+                opsBurstLogging = false
+                opsBurstStableSinceMs = 0L
+                addControllerEvent("Burst logging ended: stable tracking")
+            }
+        } else {
+            opsBurstStableSinceMs = 0L
+        }
+    }
+
+    private fun isOpsTrackingStable(control: MpptControlState): Boolean {
+        return control.enabled &&
+            control.pvMode == "Tracking" &&
+            !control.recoveryActive &&
+            control.controlBand == "FI" &&
+            abs(control.vinErrorVolts) <= OPS_STABLE_VIN_ERROR_V
+    }
+
     private fun addControllerEvent(text: String) {
-        val event = "${eventTimeFormat.format(System.currentTimeMillis())}  $text"
+        val now = System.currentTimeMillis()
+        val event = "${eventTimeFormat.format(now)}  $text"
         controllerEvents = (listOf(event) + controllerEvents).take(MAX_CONTROLLER_EVENTS)
+        if (::opsLogger.isInitialized) {
+            opsLogger.logEvent(now, text)
+        }
     }
 
     private fun updateBatteryTimeEstimate() {
@@ -376,350 +531,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun saveDebugSnapshot(json: String): String {
-        return try {
-            val file = File(filesDir, DEBUG_SNAPSHOT_FILE)
-            file.writeText(json)
-            addControllerEvent("Saved debug snapshot: $DEBUG_SNAPSHOT_FILE")
-            file.absolutePath
-        } catch (error: IOException) {
-            addControllerEvent("Debug snapshot save failed: ${error.message ?: "IO error"}")
-            ""
-        }
-    }
-
-    private fun importKneeLearningData(json: String): String {
-        return try {
-            val trimmed = json.trim()
-            if (trimmed.isBlank()) return "Nothing to import"
-
-            val imported = when {
-                trimmed.startsWith("[") -> importKneeBins(JSONArray(trimmed))
-                else -> {
-                    val root = JSONObject(trimmed)
-                    when {
-                        root.has("resetBinIndexes") -> resetKneeBins(root.getJSONArray("resetBinIndexes"))
-                        root.has("kneeLearningBins") -> importKneeBins(root.getJSONArray("kneeLearningBins"))
-                        else -> return "No kneeLearningBins or resetBinIndexes found"
-                    }
-                }
-            }
-            kneeLearningBins = imported
-            persistKneeLearningBins()
-            addControllerEvent("Imported knee table data")
-            "Imported ${imported.size} knee bins"
-        } catch (error: JSONException) {
-            "Import failed: ${error.message ?: "invalid JSON"}"
-        }
-    }
-
-    private fun importKneeBins(array: JSONArray): List<KneeLearningBin> {
-        val parsed = (0 until array.length())
-            .mapNotNull { index -> array.optJSONObject(index)?.toKneeLearningBinOrNull() }
-            .associateBy { it.index }
-
-        return defaultKneeLearningBins().map { default ->
-            parsed[default.index]
-                ?.copy(minIset = default.minIset, maxIset = default.maxIset)
-                ?.withDerivedConfidence()
-                ?: default
-        }
-    }
-
-    private fun resetKneeBins(indexes: JSONArray): List<KneeLearningBin> {
-        val resetIndexes = (0 until indexes.length())
-            .mapNotNull { indexes.optIntOrNull(it) }
-            .toSet()
-        val defaults = defaultKneeLearningBins().associateBy { it.index }
-        return kneeLearningBins.map { bin -> defaults[bin.index]?.takeIf { bin.index in resetIndexes } ?: bin }
-    }
-
-    private fun maybeLearnKneePoint(control: MpptControlState) {
-        val now = SystemClock.elapsedRealtime()
-        if (now - lastKneeLearningSampleMs < KNEE_LEARNING_SAMPLE_MS) return
-        if (!control.enabled || control.pvMode != "Tracking" || control.recoveryActive) return
-        if (control.commandIset < 0.2 || control.commandIset >= appSettings.maxChargeAmps - 0.1) return
-        if (abs(control.vinErrorVolts) > KNEE_LEARNING_MAX_ERR_V) return
-
-        val telemetry = ridenUsbState.telemetry
-        val watts = telemetry.watts ?: return
-        val iout = telemetry.iout ?: 0.0
-        val temperatureF = bmsBleState.telemetry.temperatureF
-        if (watts < KNEE_LEARNING_MIN_WATTS) return
-
-        val index = kneeLearningBins.indexOfFirst {
-            control.commandIset >= it.minIset && control.commandIset < it.maxIset
-        }
-        if (index < 0) return
-
-        lastKneeLearningSampleMs = now
-        var changed = false
-        kneeLearningBins = kneeLearningBins.mapIndexed { binIndex, bin ->
-            if (binIndex != index) {
-                if (bin.currentStableRunSeconds > 0.0 || bin.highCurrentStableRunSeconds > 0.0 || bin.candidateHighKneeVolts != null) {
-                    changed = true
-                    bin.copy(
-                        currentStableRunSeconds = 0.0,
-                        highCurrentStableRunSeconds = 0.0,
-                        candidateHighKneeVolts = null,
-                        candidateHighStableSeconds = 0.0
-                    )
-                } else {
-                    bin
-                }
-            } else {
-                val sampleSeconds = KNEE_LEARNING_SAMPLE_MS / 1000.0
-                val observedKnee = control.targetPvVolts
-                val provesCurrentLearned = bin.learnedKneeVolts?.let {
-                    abs(observedKnee - it) <= KNEE_LEARNING_KNEE_EPS_V
-                } ?: false
-                val lowerThanLearned = bin.learnedKneeVolts?.let {
-                    observedKnee < it - KNEE_LEARNING_KNEE_EPS_V
-                } ?: true
-                val sameCandidate = bin.candidateKneeVolts?.let {
-                    abs(observedKnee - it) <= KNEE_LEARNING_KNEE_EPS_V
-                } ?: false
-                val candidateKnee = if (lowerThanLearned) {
-                    if (sameCandidate) bin.candidateKneeVolts else observedKnee
-                } else {
-                    null
-                }
-                val candidateRun = if (lowerThanLearned) {
-                    if (sameCandidate) bin.candidateStableSeconds + sampleSeconds else sampleSeconds
-                } else {
-                    0.0
-                }
-                val acceptsCandidate = lowerThanLearned && candidateRun >= KNEE_LEARNING_MIN_STABLE_SECONDS
-                val nextKnee = if (acceptsCandidate) {
-                    bin.learnedKneeVolts?.let { min(it, candidateKnee ?: observedKnee) } ?: (candidateKnee ?: observedKnee)
-                } else {
-                    bin.learnedKneeVolts
-                }
-                val currentRun = when {
-                    acceptsCandidate -> candidateRun
-                    provesCurrentLearned -> bin.currentStableRunSeconds + sampleSeconds
-                    else -> 0.0
-                }
-                val learnedEvidenceSeconds = when {
-                    acceptsCandidate -> candidateRun
-                    provesCurrentLearned -> sampleSeconds
-                    else -> 0.0
-                }
-                val nextStableSeconds = bin.stableSeconds + learnedEvidenceSeconds
-                val nextLongestRun = maxOf(bin.longestStableRunSeconds, currentRun, candidateRun)
-                val nextSampleCount = bin.sampleCount + 1
-                val provesCurrentHigh = bin.highestStableKneeVolts?.let {
-                    abs(observedKnee - it) <= KNEE_LEARNING_KNEE_EPS_V
-                } ?: false
-                val higherThanLearnedHigh = bin.highestStableKneeVolts?.let {
-                    observedKnee > it + KNEE_LEARNING_KNEE_EPS_V
-                } ?: true
-                val sameHighCandidate = bin.candidateHighKneeVolts?.let {
-                    abs(observedKnee - it) <= KNEE_LEARNING_KNEE_EPS_V
-                } ?: false
-                val highCandidateKnee = if (higherThanLearnedHigh) {
-                    if (sameHighCandidate) bin.candidateHighKneeVolts else observedKnee
-                } else {
-                    null
-                }
-                val highCandidateRun = if (higherThanLearnedHigh) {
-                    if (sameHighCandidate) bin.candidateHighStableSeconds + sampleSeconds else sampleSeconds
-                } else {
-                    0.0
-                }
-                val acceptsHighCandidate = higherThanLearnedHigh &&
-                    highCandidateRun >= highKneeStableRequirementSeconds()
-                val nextHighKnee = if (acceptsHighCandidate) {
-                    bin.highestStableKneeVolts?.let { maxOf(it, highCandidateKnee ?: observedKnee) }
-                        ?: (highCandidateKnee ?: observedKnee)
-                } else {
-                    bin.highestStableKneeVolts
-                }
-                val highCurrentRun = when {
-                    acceptsHighCandidate -> highCandidateRun
-                    provesCurrentHigh -> bin.highCurrentStableRunSeconds + sampleSeconds
-                    else -> 0.0
-                }
-                val highEvidenceSeconds = when {
-                    acceptsHighCandidate -> highCandidateRun
-                    provesCurrentHigh -> sampleSeconds
-                    else -> 0.0
-                }
-                changed = true
-                bin.copy(
-                    learnedKneeVolts = nextKnee,
-                    confidence = kneeLearningConfidence(nextStableSeconds, nextLongestRun, nextSampleCount),
-                    sampleCount = nextSampleCount,
-                    stableSeconds = nextStableSeconds,
-                    currentStableRunSeconds = currentRun,
-                    longestStableRunSeconds = nextLongestRun,
-                    candidateKneeVolts = if (acceptsCandidate) null else candidateKnee,
-                    candidateStableSeconds = if (acceptsCandidate) 0.0 else candidateRun,
-                    highestStableKneeVolts = nextHighKnee,
-                    highStableSeconds = bin.highStableSeconds + highEvidenceSeconds,
-                    highCurrentStableRunSeconds = highCurrentRun,
-                    highLongestStableRunSeconds = maxOf(
-                        bin.highLongestStableRunSeconds,
-                        highCurrentRun,
-                        highCandidateRun
-                    ),
-                    candidateHighKneeVolts = if (acceptsHighCandidate) null else highCandidateKnee,
-                    candidateHighStableSeconds = if (acceptsHighCandidate) 0.0 else highCandidateRun,
-                    bestWatts = maxOf(bin.bestWatts, watts),
-                    lastIset = control.commandIset,
-                    lastIout = iout,
-                    lastWatts = watts,
-                    lastVinError = control.vinErrorVolts,
-                    lastTemperatureF = temperatureF,
-                    minTemperatureF = minNullable(bin.minTemperatureF, temperatureF),
-                    maxTemperatureF = maxNullable(bin.maxTemperatureF, temperatureF),
-                    lastUpdatedMs = System.currentTimeMillis(),
-                    manual = bin.manual && nextKnee == bin.learnedKneeVolts
-                )
-            }
-        }
-        if (changed) persistKneeLearningBins()
-    }
-
-    private fun loadKneeLearningBins(): List<KneeLearningBin> {
-        val byIndex = getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
-            .getString(KEY_KNEE_LEARNING_BINS, null)
-            ?.lineSequence()
-            ?.mapNotNull { parseKneeLearningBin(it) }
-            ?.associateBy { it.index }
-            .orEmpty()
-
-        return defaultKneeLearningBins().map { default ->
-            byIndex[default.index]
-                ?.copy(minIset = default.minIset, maxIset = default.maxIset)
-                ?.withDerivedConfidence()
-                ?: default
-        }
-    }
-
-    private fun persistKneeLearningBins() {
-        val encoded = kneeLearningBins.joinToString("\n") { bin ->
-            listOf(
-                bin.index.toString(),
-                bin.learnedKneeVolts?.toString() ?: "",
-                bin.confidence.toString(),
-                bin.sampleCount.toString(),
-                bin.stableSeconds.toString(),
-                bin.currentStableRunSeconds.toString(),
-                bin.longestStableRunSeconds.toString(),
-                bin.candidateKneeVolts?.toString() ?: "",
-                bin.candidateStableSeconds.toString(),
-                bin.bestWatts.toString(),
-                bin.lastIset.toString(),
-                bin.lastIout.toString(),
-                bin.lastWatts.toString(),
-                bin.lastVinError.toString(),
-                bin.lastTemperatureF?.toString() ?: "",
-                bin.minTemperatureF?.toString() ?: "",
-                bin.maxTemperatureF?.toString() ?: "",
-                bin.lastUpdatedMs.toString(),
-                bin.manual.toString(),
-                bin.highestStableKneeVolts?.toString() ?: "",
-                bin.highStableSeconds.toString(),
-                bin.highCurrentStableRunSeconds.toString(),
-                bin.highLongestStableRunSeconds.toString(),
-                bin.candidateHighKneeVolts?.toString() ?: "",
-                bin.candidateHighStableSeconds.toString()
-            ).joinToString("|")
-        }
-        getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE).edit {
-            putString(KEY_KNEE_LEARNING_BINS, encoded)
-        }
-    }
-
-    private fun parseKneeLearningBin(line: String): KneeLearningBin? {
-        val parts = line.split("|")
-        if (parts.size < 11) return null
-        val index = parts[0].toIntOrNull() ?: return null
-        val default = defaultKneeLearningBins().firstOrNull { it.index == index } ?: return null
-        return if (parts.size >= 25) {
-            default.copy(
-                learnedKneeVolts = parts[1].toDoubleOrNull(),
-                confidence = parts[2].toDoubleOrNull() ?: 0.0,
-                sampleCount = parts[3].toIntOrNull() ?: 0,
-                stableSeconds = parts[4].toDoubleOrNull() ?: 0.0,
-                currentStableRunSeconds = parts[5].toDoubleOrNull() ?: 0.0,
-                longestStableRunSeconds = parts[6].toDoubleOrNull() ?: 0.0,
-                candidateKneeVolts = parts[7].toDoubleOrNull(),
-                candidateStableSeconds = parts[8].toDoubleOrNull() ?: 0.0,
-                bestWatts = parts[9].toDoubleOrNull() ?: 0.0,
-                lastIset = parts[10].toDoubleOrNull() ?: 0.0,
-                lastIout = parts[11].toDoubleOrNull() ?: 0.0,
-                lastWatts = parts[12].toDoubleOrNull() ?: 0.0,
-                lastVinError = parts[13].toDoubleOrNull() ?: 0.0,
-                lastTemperatureF = parts[14].toDoubleOrNull(),
-                minTemperatureF = parts[15].toDoubleOrNull(),
-                maxTemperatureF = parts[16].toDoubleOrNull(),
-                lastUpdatedMs = parts[17].toLongOrNull() ?: 0L,
-                manual = parts[18].toBooleanStrictOrNull() ?: false,
-                highestStableKneeVolts = parts[19].toDoubleOrNull(),
-                highStableSeconds = parts[20].toDoubleOrNull() ?: 0.0,
-                highCurrentStableRunSeconds = parts[21].toDoubleOrNull() ?: 0.0,
-                highLongestStableRunSeconds = parts[22].toDoubleOrNull() ?: 0.0,
-                candidateHighKneeVolts = parts[23].toDoubleOrNull(),
-                candidateHighStableSeconds = parts[24].toDoubleOrNull() ?: 0.0
-            )
-        } else if (parts.size >= 19) {
-            default.copy(
-                learnedKneeVolts = parts[1].toDoubleOrNull(),
-                confidence = parts[2].toDoubleOrNull() ?: 0.0,
-                sampleCount = parts[3].toIntOrNull() ?: 0,
-                stableSeconds = parts[4].toDoubleOrNull() ?: 0.0,
-                currentStableRunSeconds = parts[5].toDoubleOrNull() ?: 0.0,
-                longestStableRunSeconds = parts[6].toDoubleOrNull() ?: 0.0,
-                candidateKneeVolts = parts[7].toDoubleOrNull(),
-                candidateStableSeconds = parts[8].toDoubleOrNull() ?: 0.0,
-                bestWatts = parts[9].toDoubleOrNull() ?: 0.0,
-                lastIset = parts[10].toDoubleOrNull() ?: 0.0,
-                lastIout = parts[11].toDoubleOrNull() ?: 0.0,
-                lastWatts = parts[12].toDoubleOrNull() ?: 0.0,
-                lastVinError = parts[13].toDoubleOrNull() ?: 0.0,
-                lastTemperatureF = parts[14].toDoubleOrNull(),
-                minTemperatureF = parts[15].toDoubleOrNull(),
-                maxTemperatureF = parts[16].toDoubleOrNull(),
-                lastUpdatedMs = parts[17].toLongOrNull() ?: 0L,
-                manual = parts[18].toBooleanStrictOrNull() ?: false
-            )
-        } else if (parts.size >= 17) {
-            default.copy(
-                learnedKneeVolts = parts[1].toDoubleOrNull(),
-                confidence = parts[2].toDoubleOrNull() ?: 0.0,
-                sampleCount = parts[3].toIntOrNull() ?: 0,
-                stableSeconds = parts[4].toDoubleOrNull() ?: 0.0,
-                currentStableRunSeconds = parts[5].toDoubleOrNull() ?: 0.0,
-                longestStableRunSeconds = parts[6].toDoubleOrNull() ?: 0.0,
-                bestWatts = parts[7].toDoubleOrNull() ?: 0.0,
-                lastIset = parts[8].toDoubleOrNull() ?: 0.0,
-                lastIout = parts[9].toDoubleOrNull() ?: 0.0,
-                lastWatts = parts[10].toDoubleOrNull() ?: 0.0,
-                lastVinError = parts[11].toDoubleOrNull() ?: 0.0,
-                lastTemperatureF = parts[12].toDoubleOrNull(),
-                minTemperatureF = parts[13].toDoubleOrNull(),
-                maxTemperatureF = parts[14].toDoubleOrNull(),
-                lastUpdatedMs = parts[15].toLongOrNull() ?: 0L,
-                manual = parts[16].toBooleanStrictOrNull() ?: false
-            )
-        } else {
-            default.copy(
-                learnedKneeVolts = parts[1].toDoubleOrNull(),
-                confidence = parts[2].toDoubleOrNull() ?: 0.0,
-                sampleCount = parts[3].toIntOrNull() ?: 0,
-                bestWatts = parts[4].toDoubleOrNull() ?: 0.0,
-                lastIset = parts[5].toDoubleOrNull() ?: 0.0,
-                lastIout = parts[6].toDoubleOrNull() ?: 0.0,
-                lastWatts = parts[7].toDoubleOrNull() ?: 0.0,
-                lastVinError = parts[8].toDoubleOrNull() ?: 0.0,
-                lastUpdatedMs = parts[9].toLongOrNull() ?: 0L,
-                manual = parts[10].toBooleanStrictOrNull() ?: false
-            )
-        }
-    }
-
     private fun applyKeepScreenOn(enabled: Boolean) {
         window.decorView.keepScreenOn = enabled
         if (enabled) {
@@ -729,11 +540,146 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun highKneeStableRequirementSeconds(): Double {
-        return maxOf(
-            appSettings.kneeTrackingDelaySeconds + KNEE_LEARNING_HIGH_EXTRA_STABLE_SECONDS,
-            appSettings.kneeTrackingDelaySeconds * KNEE_LEARNING_HIGH_STABLE_MULTIPLIER
+    private fun maybeRecordOpsTelemetry(force: Boolean = false) {
+        if (!::opsLogger.isInitialized) return
+        if (!opsTelemetryReady()) return
+
+        val control = mpptControlState
+        val nowMs = System.currentTimeMillis()
+        val intervalMs = opsTelemetryIntervalMs(control)
+        if (!force && nowMs - lastOpsSampleMs < intervalMs) return
+
+        val bms = bmsBleState.telemetry
+        val riden = ridenUsbState.telemetry
+        val batteryVolts = bms.packVoltage ?: return
+        val batteryAmps = bms.packCurrent ?: return
+        val soc = bms.socPercent ?: return
+
+        lastOpsSampleMs = nowMs
+        lastOpsTelemetryBand = control.controlBand
+        lastOpsTelemetryPvMode = control.pvMode
+        val ridenVin = riden.vin ?: 0.0
+        val ridenVout = riden.vout ?: 0.0
+        val ridenPout = riden.watts ?: 0.0
+        val ridenPinEst = if (ridenVin > 0.0 && ridenVout > 0.0 && ridenPout > 0.0) {
+            ridenPout * (ridenVin / ridenVout)
+        } else {
+            0.0
+        }
+        opsLogger.logTelemetry(
+            OpsTelemetrySample(
+                timestampMs = nowMs,
+                pvMode = control.pvMode,
+                controlBand = control.controlBand,
+                recoveryPhase = control.recoveryPhase,
+                recoveryCycleCount = control.recoveryCycleCount,
+                targetPvVolts = control.targetPvVolts,
+                kneeOffsetVolts = control.kneeOffsetVolts,
+                vinErrorVolts = control.vinErrorVolts,
+                commandIset = control.commandIset,
+                controlStepAmps = control.controlStepAmps,
+                policyLimitAmps = control.policyLimitAmps,
+                ridenVin = ridenVin,
+                ridenVout = ridenVout,
+                ridenIout = riden.iout ?: 0.0,
+                ridenWatts = ridenPout,
+                batteryVolts = batteryVolts,
+                batteryAmps = batteryAmps,
+                batteryWatts = batteryVolts * batteryAmps,
+                socPercent = soc,
+                temperatureF = bms.temperatureF ?: 0.0,
+                ridenConnected = ridenUsbState.connected,
+                bmsConnected = bmsBleState.connectedDeviceAddress != null,
+                kneeProbeFast = control.kneeProbeFast,
+                vtuneProbePhase = control.vtuneProbePhase,
+                huntLockTicks = control.huntLockTicks,
+                ridenPinEstW = ridenPinEst,
+                ridenPoutW = ridenPout,
+                acceptedProbePinW = control.acceptedProbePinWatts,
+                vtuneDescentBlocked = control.vtuneDescentBlocked,
+                powerBasedVtuneStop = appSettings.powerBasedVtuneStop
+            )
         )
+        maybeCheckLogStorage(nowMs)
+    }
+
+    private fun opsTelemetryIntervalMs(control: MpptControlState): Long {
+        if (opsBurstLogging || control.recoveryActive || control.pvMode == "Recover" ||
+            control.kneeProbeFast || control.vtuneProbePhase == "WaitLock" || control.vtuneProbePhase == "Pause"
+        ) {
+            return OPS_SAMPLE_BURST_MS
+        }
+        if (!control.enabled) return OPS_SAMPLE_IDLE_MS
+        return when (control.controlBand) {
+            "HU", "FA", "MD" -> OPS_SAMPLE_AGGRESSIVE_MS
+            "NE" -> OPS_SAMPLE_NEAR_MS
+            "FI" -> OPS_SAMPLE_STABLE_MS
+            else -> OPS_SAMPLE_OTHER_MS
+        }
+    }
+
+    private fun opsTelemetryReady(): Boolean {
+        val bms = bmsBleState.telemetry
+        val riden = ridenUsbState.telemetry
+        return bmsBleState.connectedDeviceAddress != null &&
+            ridenUsbState.connected &&
+            bms.packVoltage != null &&
+            bms.packCurrent != null &&
+            bms.socPercent != null &&
+            riden.vin != null &&
+            riden.vout != null &&
+            riden.iout != null &&
+            riden.watts != null
+    }
+
+    private fun maybeCheckLogStorage(nowMs: Long) {
+        if (nowMs - lastOpsStorageCheckMs < OPS_STORAGE_CHECK_MS) return
+        lastOpsStorageCheckMs = nowMs
+        refreshOpsLogSummary()
+        val total = opsLogSummary.totalBytes
+        if (total < OpsLogger.STORAGE_WARN_BYTES) {
+            logStorageWarningDismissed = false
+            return
+        }
+        if (!logStorageWarningDismissed) {
+            logStorageWarning =
+                "Operational logs are using ${OpsLogger.formatSize(total)}. " +
+                    "Delete older logs from Tools > Logs when you are ready."
+        }
+    }
+
+    private fun refreshOpsLogSummary() {
+        if (!::opsLogger.isInitialized) return
+        opsLogSummary = opsLogger.refreshSummary()
+    }
+
+    private fun deleteOpsLogsBeforeDate(cutoffDateLabel: String): String {
+        if (!::opsLogger.isInitialized) return "Logger not ready"
+        if (!cutoffDateLabel.matches(Regex("\\d{4}-\\d{2}-\\d{2}"))) {
+            return "Use date format YYYY-MM-DD"
+        }
+        val parsed = try {
+            SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { isLenient = false }.parse(cutoffDateLabel)
+        } catch (_: Exception) {
+            null
+        }
+        if (parsed == null) return "Invalid date: $cutoffDateLabel"
+        return try {
+            val removed = opsLogger.deleteLogsBeforeDate(cutoffDateLabel)
+            refreshOpsLogSummary()
+            if (opsLogSummary.totalBytes < OpsLogger.STORAGE_WARN_BYTES) {
+                logStorageWarningDismissed = false
+                logStorageWarning = null
+            }
+            if (removed == 0) {
+                "No log files found before $cutoffDateLabel"
+            } else {
+                addControllerEvent("Deleted $removed ops log file(s) before $cutoffDateLabel")
+                "Deleted $removed file(s) before $cutoffDateLabel"
+            }
+        } catch (error: IOException) {
+            "Delete failed: ${error.message ?: "IO error"}"
+        }
     }
 
     private fun applyControllerKeepAlive(enabled: Boolean) {
@@ -792,6 +738,14 @@ class MainActivity : ComponentActivity() {
                 KEY_KNEE_TRACKING_DELAY_S,
                 prefs.getFloat(KEY_HCC_QUIET_S, defaults.kneeTrackingDelaySeconds.toFloat())
             ).toDouble(),
+            fastAcquireSuccessCount = prefs.getInt(
+                KEY_FAST_ACQUIRE_SUCCESS_COUNT,
+                defaults.fastAcquireSuccessCount
+            ).coerceIn(1, 5),
+            powerBasedVtuneStop = prefs.getBoolean(
+                KEY_POWER_BASED_VTUNE_STOP,
+                defaults.powerBasedVtuneStop
+            ),
             controllerLoopMs = prefs.getInt(KEY_CONTROLLER_LOOP_MS, defaults.controllerLoopMs),
             keepScreenOn = prefs.getBoolean(KEY_KEEP_SCREEN_ON, defaults.keepScreenOn)
         )
@@ -813,6 +767,8 @@ class MainActivity : ComponentActivity() {
             putFloat(KEY_MAX_TARGET_PV_V, settings.maxTargetPvVolts.toFloat())
             putFloat(KEY_KNEE_STEP_V, settings.kneeStepVolts.toFloat())
             putFloat(KEY_KNEE_TRACKING_DELAY_S, settings.kneeTrackingDelaySeconds.toFloat())
+            putInt(KEY_FAST_ACQUIRE_SUCCESS_COUNT, settings.fastAcquireSuccessCount.coerceIn(1, 5))
+            putBoolean(KEY_POWER_BASED_VTUNE_STOP, settings.powerBasedVtuneStop)
             putInt(KEY_CONTROLLER_LOOP_MS, settings.controllerLoopMs)
             putBoolean(KEY_KEEP_SCREEN_ON, settings.keepScreenOn)
         }
@@ -1113,9 +1069,10 @@ class MainActivity : ComponentActivity() {
         private const val KEY_MIN_TARGET_PV_V = "min_target_pv_v"
         private const val KEY_MAX_TARGET_PV_V = "max_target_pv_v"
         private const val KEY_KNEE_STEP_V = "knee_step_v"
-        private const val KEY_KNEE_LEARNING_BINS = "knee_learning_bins"
         private const val KEY_HCC_QUIET_S = "hcc_quiet_s"
         private const val KEY_KNEE_TRACKING_DELAY_S = "knee_tracking_delay_s"
+        private const val KEY_FAST_ACQUIRE_SUCCESS_COUNT = "fast_acquire_success_count"
+        private const val KEY_POWER_BASED_VTUNE_STOP = "power_based_vtune_stop"
         private const val KEY_CONTROLLER_LOOP_MS = "controller_loop_ms"
         private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
         private const val KEY_ENERGY_DAY_KEY = "energy_day_key"
@@ -1128,116 +1085,22 @@ class MainActivity : ComponentActivity() {
         private const val ENERGY_MAX_DT_MS = 60_000L
         private const val ENERGY_PERSIST_MS = 5_000L
         private const val HISTORY_FILE = "controller_history.csv"
-        private const val DEBUG_SNAPSHOT_FILE = "debug_snapshot.json"
         private const val HISTORY_SAMPLE_MS = 30_000L
         private const val HISTORY_KEEP_DAYS = 30
         private const val HISTORY_PRUNE_MS = 300_000L
-        private const val KNEE_LEARNING_SAMPLE_MS = 5_000L
-        private const val KNEE_LEARNING_MAX_ERR_V = 0.50
-        private const val KNEE_LEARNING_MIN_WATTS = 10.0
-        private const val KNEE_LEARNING_MIN_STABLE_SECONDS = 30.0
-        private const val KNEE_LEARNING_HIGH_EXTRA_STABLE_SECONDS = 30.0
-        private const val KNEE_LEARNING_HIGH_STABLE_MULTIPLIER = 1.25
-        private const val KNEE_LEARNING_KNEE_EPS_V = 0.05
+        private const val OPS_SAMPLE_BURST_MS = 200L
+        private const val OPS_BURST_STABLE_CLEAR_MS = 5_000L
+        private const val OPS_STABLE_VIN_ERROR_V = 0.05
+        private const val OPS_KNEE_DOWN_EPS_V = 0.001
+        private const val OPS_SAMPLE_AGGRESSIVE_MS = 5_000L
+        private const val OPS_SAMPLE_NEAR_MS = 30_000L
+        private const val OPS_SAMPLE_STABLE_MS = 90_000L
+        private const val OPS_SAMPLE_OTHER_MS = 60_000L
+        private const val OPS_SAMPLE_IDLE_MS = 120_000L
+        private const val OPS_STORAGE_CHECK_MS = 60_000L
         private const val MAX_CONTROLLER_EVENTS = 80
         private val eventTimeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
     }
-}
-
-private const val KNEE_LEARNING_CONFIDENCE_FULL_STABLE_S = 900.0
-private const val KNEE_LEARNING_CONFIDENCE_FULL_RUN_S = 180.0
-private const val KNEE_LEARNING_CONFIDENCE_FULL_SAMPLES = 300.0
-
-private fun minNullable(a: Double?, b: Double?): Double? = when {
-    a == null -> b
-    b == null -> a
-    else -> minOf(a, b)
-}
-
-private fun maxNullable(a: Double?, b: Double?): Double? = when {
-    a == null -> b
-    b == null -> a
-    else -> maxOf(a, b)
-}
-
-private fun defaultKneeLearningBins(): List<KneeLearningBin> {
-    val edges = listOf(0.0, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 14.0, 18.0, 22.0, 26.0)
-    return edges.zipWithNext().mapIndexed { index, (min, max) ->
-        KneeLearningBin(
-            index = index,
-            minIset = min,
-            maxIset = max,
-            learnedKneeVolts = null,
-            confidence = 0.0,
-            sampleCount = 0,
-            bestWatts = 0.0,
-            lastIset = 0.0,
-            lastIout = 0.0,
-            lastWatts = 0.0,
-            lastVinError = 0.0,
-            lastUpdatedMs = 0L,
-            manual = false
-        )
-    }
-}
-
-private fun JSONObject.toKneeLearningBinOrNull(): KneeLearningBin? {
-    val index = optIntOrNull("index") ?: return null
-    val default = defaultKneeLearningBins().firstOrNull { it.index == index } ?: return null
-    return default.copy(
-        learnedKneeVolts = optNullableDouble("learnedKneeVolts"),
-        confidence = optDouble("confidence", 0.0),
-        sampleCount = optInt("sampleCount", 0),
-        stableSeconds = optDouble("stableSeconds", 0.0),
-        currentStableRunSeconds = optDouble("currentStableRunSeconds", 0.0),
-        longestStableRunSeconds = optDouble("longestStableRunSeconds", 0.0),
-        candidateKneeVolts = optNullableDouble("candidateKneeVolts"),
-        candidateStableSeconds = optDouble("candidateStableSeconds", 0.0),
-        highestStableKneeVolts = optNullableDouble("highestStableKneeVolts"),
-        highStableSeconds = optDouble("highStableSeconds", 0.0),
-        highCurrentStableRunSeconds = optDouble("highCurrentStableRunSeconds", 0.0),
-        highLongestStableRunSeconds = optDouble("highLongestStableRunSeconds", 0.0),
-        candidateHighKneeVolts = optNullableDouble("candidateHighKneeVolts"),
-        candidateHighStableSeconds = optDouble("candidateHighStableSeconds", 0.0),
-        bestWatts = optDouble("bestWatts", 0.0),
-        lastIset = optDouble("lastIset", 0.0),
-        lastIout = optDouble("lastIout", 0.0),
-        lastWatts = optDouble("lastWatts", 0.0),
-        lastVinError = optDouble("lastVinError", 0.0),
-        lastTemperatureF = optNullableDouble("lastTemperatureF"),
-        minTemperatureF = optNullableDouble("minTemperatureF"),
-        maxTemperatureF = optNullableDouble("maxTemperatureF"),
-        lastUpdatedMs = optLong("lastUpdatedMs", 0L),
-        manual = optBoolean("manual", false)
-    )
-}
-
-private fun JSONObject.optIntOrNull(name: String): Int? {
-    return if (has(name) && !isNull(name)) optInt(name) else null
-}
-
-private fun JSONObject.optNullableDouble(name: String): Double? {
-    return if (has(name) && !isNull(name)) optDouble(name) else null
-}
-
-private fun JSONArray.optIntOrNull(index: Int): Int? {
-    return if (index in 0 until length() && !isNull(index)) optInt(index) else null
-}
-
-private fun KneeLearningBin.withDerivedConfidence(): KneeLearningBin {
-    val derived = kneeLearningConfidence(stableSeconds, longestStableRunSeconds, sampleCount)
-    return copy(confidence = if (manual && learnedKneeVolts != null) derived.coerceAtLeast(0.25) else derived)
-}
-
-private fun kneeLearningConfidence(
-    stableSeconds: Double,
-    longestStableRunSeconds: Double,
-    sampleCount: Int
-): Double {
-    val stableScore = (stableSeconds / KNEE_LEARNING_CONFIDENCE_FULL_STABLE_S).coerceIn(0.0, 1.0)
-    val runScore = (longestStableRunSeconds / KNEE_LEARNING_CONFIDENCE_FULL_RUN_S).coerceIn(0.0, 1.0)
-    val sampleScore = (sampleCount.toDouble() / KNEE_LEARNING_CONFIDENCE_FULL_SAMPLES).coerceIn(0.0, 1.0)
-    return (stableScore * 0.55 + runScore * 0.35 + sampleScore * 0.10).coerceIn(0.0, 1.0)
 }
 
 private fun batteryTimeEstimate(
@@ -1406,7 +1269,8 @@ private fun RidenBmsApp(
     historyPoints: List<HistoryPoint>,
     controllerEvents: List<String>,
     alertState: AlertState,
-    kneeLearningBins: List<KneeLearningBin>,
+    opsLogSummary: OpsLogStorageSummary,
+    logStorageWarning: String?,
     batteryTimeEstimateText: String,
     onSettingsChanged: (AppSettings) -> Unit,
     onRequestBlePermissions: () -> Unit,
@@ -1420,8 +1284,9 @@ private fun RidenBmsApp(
     onResetEnergyTotal: () -> Unit,
     onResetLearnedKnee: () -> Unit,
     onSetActiveKnee: (Double) -> Unit,
-    onSaveDebugSnapshot: (String) -> String,
-    onImportKneeData: (String) -> String,
+    onDeleteOpsLogsBeforeDate: (String) -> String,
+    onRefreshOpsLogSummary: () -> Unit,
+    onDismissLogStorageWarning: () -> Unit,
     onSilenceLowSocAlarm: () -> Unit
 ) {
     val state = remember(
@@ -1433,7 +1298,7 @@ private fun RidenBmsApp(
         historyPoints,
         controllerEvents,
         alertState,
-        kneeLearningBins,
+        opsLogSummary,
         batteryTimeEstimateText
     ) {
         AppState.preview.copy(
@@ -1442,7 +1307,7 @@ private fun RidenBmsApp(
             history = historyPoints,
             events = controllerEvents,
             alerts = alertState,
-            kneeLearningBins = kneeLearningBins,
+            opsLogSummary = opsLogSummary,
             batteryTimeEstimateText = batteryTimeEstimateText
         )
             .withBmsTelemetry(bmsBleState)
@@ -1451,6 +1316,19 @@ private fun RidenBmsApp(
     }
     var selectedTab by rememberSaveable { mutableStateOf(AppTab.Dashboard) }
     val tabStateHolder = rememberSaveableStateHolder()
+
+    if (logStorageWarning != null) {
+        AlertDialog(
+            onDismissRequest = onDismissLogStorageWarning,
+            title = { Text("Log Storage Warning") },
+            text = { Text(logStorageWarning) },
+            confirmButton = {
+                TextButton(onClick = onDismissLogStorageWarning) {
+                    Text("Dismiss")
+                }
+            }
+        )
+    }
 
     Scaffold(
         bottomBar = {
@@ -1500,8 +1378,8 @@ private fun RidenBmsApp(
                 AppTab.Tools -> ToolsScreen(
                     state = state,
                     modifier = Modifier.padding(innerPadding),
-                    onSaveDebugSnapshot = onSaveDebugSnapshot,
-                    onImportKneeData = onImportKneeData
+                    onDeleteOpsLogsBeforeDate = onDeleteOpsLogsBeforeDate,
+                    onRefreshOpsLogSummary = onRefreshOpsLogSummary
                 )
             }
         }

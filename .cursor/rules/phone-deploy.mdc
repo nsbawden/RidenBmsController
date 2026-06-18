@@ -1,0 +1,18 @@
+---
+description: Install debug builds to the phone and relaunch the app after updating
+alwaysApply: true
+---
+
+# Phone deploy and relaunch
+
+When installing or updating the app on a connected phone (USB or wireless ADB):
+
+1. Build and install from the project root:
+   ```powershell
+   .\gradlew.bat installDebug
+   ```
+2. **Always relaunch the app after install.** `installDebug` replaces the APK but does not open the app; the user may think it disappeared (launcher name is **MPPT**).
+   ```powershell
+   adb shell am start -n com.example.ridenbmscontroller/.MainActivity
+   ```
+3. Confirm the device is connected first: `adb devices`
