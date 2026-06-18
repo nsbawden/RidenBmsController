@@ -63,7 +63,8 @@ data class ControllerState(
     val ridenConnected: Boolean,
     val bmsConnected: Boolean,
     val recoveryActive: Boolean,
-    val socTargetPercent: Int
+    val socTargetPercent: Int,
+    val effectiveKneeDelaySeconds: Double = 30.0
 )
 
 data class AlertState(
@@ -87,8 +88,10 @@ data class AppSettings(
     val minTargetPvVolts: Double,
     val maxTargetPvVolts: Double,
     val kneeStepVolts: Double,
-    val kneeTrackingDelaySeconds: Double,
+    val kneeTrackingDelayMinSeconds: Double,
+    val kneeTrackingDelayMaxSeconds: Double,
     val fastAcquireSuccessCount: Int,
+    val powerBasedVtuneStop: Boolean,
     val controllerLoopMs: Int,
     val keepScreenOn: Boolean
 )
@@ -191,8 +194,10 @@ data class AppState(
                 minTargetPvVolts = 30.0,
                 maxTargetPvVolts = 36.0,
                 kneeStepVolts = 0.10,
-                kneeTrackingDelaySeconds = 12.0,
+                kneeTrackingDelayMinSeconds = 30.0,
+                kneeTrackingDelayMaxSeconds = 300.0,
                 fastAcquireSuccessCount = 2,
+                powerBasedVtuneStop = false,
                 controllerLoopMs = 200,
                 keepScreenOn = true
             ),

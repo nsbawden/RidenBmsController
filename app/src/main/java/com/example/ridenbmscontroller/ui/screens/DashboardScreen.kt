@@ -362,10 +362,21 @@ private fun RidenPanel(state: AppState, onSetActiveKnee: (Double) -> Unit) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 val today = state.energy.whToday.formatWattHours()
                 val yesterday = state.energy.whYesterday.formatWattHours()
-                val total = state.energy.whTotal.formatWattHours()
+                val kneeDelayS = state.controller.effectiveKneeDelaySeconds
+                val kneeDelayColor = when {
+                    kneeDelayS >= state.settings.kneeTrackingDelayMaxSeconds -> WarningOrange
+                    kneeDelayS <= state.settings.kneeTrackingDelayMinSeconds -> BatteryGreen
+                    else -> VoltageAmber
+                }
                 ValueTile("Wh Today", today.value, today.unit, TextPrimary, Modifier.weight(1f))
                 ValueTile("Wh Yday", yesterday.value, yesterday.unit, TextPrimary, Modifier.weight(1f))
-                ValueTile("Wh Total", total.value, total.unit, TextPrimary, Modifier.weight(1f))
+                ValueTile(
+                    "Knee Delay",
+                    kneeDelayS.toInt().toString(),
+                    "s",
+                    kneeDelayColor,
+                    Modifier.weight(1f)
+                )
             }
         }
     }

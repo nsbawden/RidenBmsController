@@ -43,12 +43,22 @@ data class OpsTelemetrySample(
     val ridenConnected: Boolean,
     val bmsConnected: Boolean,
     val kneeProbeFast: Boolean = false,
-    val floorProbePhase: String = "--",
+    val vtuneProbePhase: String = "--",
     val huntLockTicks: Int = 0,
     val ridenPinEstW: Double = 0.0,
     val ridenPoutW: Double = 0.0,
-    val mppWantsLowerFloor: Boolean = false,
-    val mppDirection: String = "--"
+    val acceptedProbePinW: Double = 0.0,
+    val vtuneDescentBlocked: Boolean = false,
+    val powerBasedVtuneStop: Boolean = false,
+    val pastMppActive: Boolean = false,
+    val pastMppWrongWay: Boolean = false,
+    val pastMppVinBelowKneeV: Double = 0.0,
+    val pastMppIsetDeltaA: Double = 0.0,
+    val pastMppPoutDeltaW: Double = 0.0,
+    val pastMppMissedW: Double = 0.0,
+    val pastMppEpisodeCount: Int = 0,
+    val pastMppCumulativeMissedW: Double = 0.0,
+    val effectiveKneeDelaySeconds: Double = 30.0
 )
 
 class OpsLogger(baseDir: File) {
@@ -57,7 +67,7 @@ class OpsLogger(baseDir: File) {
 
     fun logTelemetry(sample: OpsTelemetrySample) {
         val file = telemetryFileFor(sample.timestampMs)
-        ensureHeader(file, TELEMETRY_HEADER_V4)
+        ensureHeader(file, TELEMETRY_HEADER)
         file.appendText(sample.toCsvLine() + "\n")
     }
 
@@ -78,7 +88,8 @@ class OpsLogger(baseDir: File) {
                 file.name.endsWith("_telemetry.csv") ||
                     file.name.endsWith("_telemetry_v2.csv") ||
                     file.name.endsWith("_telemetry_v3.csv") ||
-                    file.name.endsWith("_telemetry_v4.csv") ->
+                    file.name.endsWith("_telemetry_v4.csv") ||
+                    file.name.endsWith("_telemetry_v5.csv") ->
                     current.copy(telemetryBytes = current.telemetryBytes + file.length())
                 file.name.endsWith("_events.csv") ->
                     current.copy(eventsBytes = current.eventsBytes + file.length())
@@ -117,8 +128,18 @@ class OpsLogger(baseDir: File) {
             if (!header.contains("power_based_vtune_stop")) {
                 return File(logDir, "${day}_telemetry_v3.csv")
             }
-            if (!header.contains("mpp_wants_lower_floor")) {
+            if (!header.contains("past_mpp_active")) {
                 return File(logDir, "${day}_telemetry_v4.csv")
+            }
+            if (!header.contains("effective_knee_delay_s")) {
+                val v4 = File(logDir, "${day}_telemetry_v4.csv")
+                if (v4.exists() && v4.length() > 0L) {
+                    val v4Header = v4.bufferedReader().use { it.readLine() }.orEmpty()
+                    if (!v4Header.contains("effective_knee_delay_s")) {
+                        return File(logDir, "${day}_telemetry_v5.csv")
+                    }
+                }
+                return File(logDir, "${day}_telemetry_v5.csv")
             }
         }
         return legacy
@@ -163,12 +184,22 @@ class OpsLogger(baseDir: File) {
             if (ridenConnected) 1 else 0,
             if (bmsConnected) 1 else 0,
             if (kneeProbeFast) 1 else 0,
-            floorProbePhase,
+            vtuneProbePhase,
             huntLockTicks,
             ridenPinEstW,
             ridenPoutW,
-            if (mppWantsLowerFloor) 1 else 0,
-            mppDirection
+            acceptedProbePinW,
+            if (vtuneDescentBlocked) 1 else 0,
+            if (powerBasedVtuneStop) 1 else 0,
+            if (pastMppActive) 1 else 0,
+            if (pastMppWrongWay) 1 else 0,
+            pastMppVinBelowKneeV,
+            pastMppIsetDeltaA,
+            pastMppPoutDeltaW,
+            pastMppMissedW,
+            pastMppEpisodeCount,
+            pastMppCumulativeMissedW,
+            effectiveKneeDelaySeconds
         ).joinToString(",")
     }
 
@@ -177,13 +208,16 @@ class OpsLogger(baseDir: File) {
         const val STORAGE_WARN_BYTES = 50L * 1024L * 1024L
         private val DATE_PATTERN = Regex("\\d{4}-\\d{2}-\\d{2}")
 
-        const val TELEMETRY_HEADER_V4 =
+        const val TELEMETRY_HEADER =
             "timestamp_ms,pv_mode,control_band,recovery_phase,recovery_cycle_count," +
                 "target_pv_v,knee_offset_v,vin_error_v,command_iset_a,control_step_a,policy_limit_a," +
                 "riden_vin_v,riden_vout_v,riden_iout_a,riden_watts_w," +
                 "battery_v,battery_a,battery_w,soc_pct,temp_f,riden_connected,bms_connected," +
-                "knee_probe_fast,floor_probe_phase,hunt_lock_ticks,riden_pin_est_w,riden_pout_w," +
-                "mpp_wants_lower_floor,mpp_direction"
+                "knee_probe_fast,vtune_probe_phase,hunt_lock_ticks,riden_pin_est_w,riden_pout_w," +
+                "accepted_probe_pin_w,vtune_descent_blocked,power_based_vtune_stop," +
+                "past_mpp_active,past_mpp_wrong_way,past_mpp_vin_below_knee_v," +
+                "past_mpp_iset_delta_a,past_mpp_pout_delta_w,past_mpp_missed_w," +
+                "past_mpp_episodes_total,past_mpp_cumulative_missed_w,effective_knee_delay_s"
 
         const val EVENTS_HEADER = "timestamp_ms,event"
 
