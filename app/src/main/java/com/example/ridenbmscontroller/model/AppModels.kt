@@ -89,7 +89,6 @@ data class AppSettings(
     val kneeStepVolts: Double,
     val kneeTrackingDelaySeconds: Double,
     val fastAcquireSuccessCount: Int,
-    val powerBasedVtuneStop: Boolean,
     val controllerLoopMs: Int,
     val keepScreenOn: Boolean
 )
@@ -194,7 +193,6 @@ data class AppState(
                 kneeStepVolts = 0.10,
                 kneeTrackingDelaySeconds = 12.0,
                 fastAcquireSuccessCount = 2,
-                powerBasedVtuneStop = false,
                 controllerLoopMs = 200,
                 keepScreenOn = true
             ),

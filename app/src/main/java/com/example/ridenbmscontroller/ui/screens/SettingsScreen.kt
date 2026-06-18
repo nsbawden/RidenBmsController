@@ -111,17 +111,14 @@ fun SettingsScreen(
             NumberFieldRow("Maximum target PV", settings.maxTargetPvVolts, "V", 10.0, 150.0) {
                 onSettingsChanged(settings.copy(maxTargetPvVolts = it.coerceAtLeast(settings.minTargetPvVolts)))
             }
-            NumberFieldRow("Knee step", settings.kneeStepVolts, "V", 0.01, 1.0) {
+            NumberFieldRow("Floor step", settings.kneeStepVolts, "V", 0.01, 1.0) {
                 onSettingsChanged(settings.copy(kneeStepVolts = it))
             }
-            NumberFieldRow("Knee Tracking Delay", settings.kneeTrackingDelaySeconds, "s", 0.0, 300.0) {
+            NumberFieldRow("Slow floor probe interval", settings.kneeTrackingDelaySeconds, "s", 0.0, 300.0) {
                 onSettingsChanged(settings.copy(kneeTrackingDelaySeconds = it))
             }
-            IntFieldRow("Fast acquire after", settings.fastAcquireSuccessCount, "stable probes", 1, 5) {
+            IntFieldRow("Fast floor after", settings.fastAcquireSuccessCount, "stable probes", 1, 5) {
                 onSettingsChanged(settings.copy(fastAcquireSuccessCount = it))
-            }
-            ToggleRow("Power-based VTune stop", settings.powerBasedVtuneStop) {
-                onSettingsChanged(settings.copy(powerBasedVtuneStop = it))
             }
             IntFieldRow("Controller loop", settings.controllerLoopMs, "ms", 100, 2000) {
                 onSettingsChanged(settings.copy(controllerLoopMs = it))

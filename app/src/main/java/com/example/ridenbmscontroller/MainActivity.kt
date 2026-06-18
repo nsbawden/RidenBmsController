@@ -106,8 +106,8 @@ class MainActivity : ComponentActivity() {
     private var opsBurstLogging = false
     private var opsBurstStableSinceMs = 0L
     private var lastLoggedKneeProbeFast = false
-    private var lastLoggedVtuneProbePhase = "--"
-    private var lastLoggedVtuneDescentBlocked = false
+    private var lastLoggedFloorProbePhase = "--"
+    private var lastLoggedMppWantsLowerFloor = false
     private lateinit var opsLogger: OpsLogger
     private var batteryCurrentAverage = RollingAverageWindow(60_000L)
     private var historyAccumulator = HistoryAccumulator()
@@ -185,15 +185,6 @@ class MainActivity : ComponentActivity() {
                         if (it != previous) {
                             appSettings = it
                             saveSettings(it)
-                            if (it.powerBasedVtuneStop != previous.powerBasedVtuneStop) {
-                                addControllerEvent(
-                                    if (it.powerBasedVtuneStop) {
-                                        "Power-based VTune stop enabled"
-                                    } else {
-                                        "Power-based VTune stop disabled (collapse only)"
-                                    }
-                                )
-                            }
                             applyKeepScreenOn(it.keepScreenOn)
                             applyControllerKeepAlive(it.controllerEnabled)
                             updateLowSocAlarm()
@@ -403,27 +394,27 @@ class MainActivity : ComponentActivity() {
         }
         if (state.kneeProbeFast != lastLoggedKneeProbeFast) {
             if (state.kneeProbeFast) {
-                addControllerEvent("VTune fast acquire started")
+                addControllerEvent("Fast floor probing started")
             } else {
-                addControllerEvent("VTune fast acquire ended")
+                addControllerEvent("Fast floor probing ended")
             }
             lastLoggedKneeProbeFast = state.kneeProbeFast
             forceTelemetry = true
         }
-        if (state.vtuneProbePhase != lastLoggedVtuneProbePhase && state.vtuneProbePhase != "--") {
-            addControllerEvent("VTune probe phase: $lastLoggedVtuneProbePhase -> ${state.vtuneProbePhase}")
-            lastLoggedVtuneProbePhase = state.vtuneProbePhase
+        if (state.floorProbePhase != lastLoggedFloorProbePhase && state.floorProbePhase != "--") {
+            addControllerEvent("Floor probe phase: $lastLoggedFloorProbePhase -> ${state.floorProbePhase}")
+            lastLoggedFloorProbePhase = state.floorProbePhase
             forceTelemetry = true
-        } else if (state.vtuneProbePhase == "--" && lastLoggedVtuneProbePhase != "--") {
-            lastLoggedVtuneProbePhase = "--"
+        } else if (state.floorProbePhase == "--" && lastLoggedFloorProbePhase != "--") {
+            lastLoggedFloorProbePhase = "--"
         }
-        if (state.vtuneDescentBlocked != lastLoggedVtuneDescentBlocked) {
-            if (state.vtuneDescentBlocked) {
-                addControllerEvent("VTune descent blocked (power limit)")
+        if (state.mppWantsLowerFloor != lastLoggedMppWantsLowerFloor) {
+            if (state.mppWantsLowerFloor) {
+                addControllerEvent("MPP wants lower floor")
             } else {
-                addControllerEvent("VTune descent unblocked")
+                addControllerEvent("MPP floor satisfied")
             }
-            lastLoggedVtuneDescentBlocked = state.vtuneDescentBlocked
+            lastLoggedMppWantsLowerFloor = state.mppWantsLowerFloor
             forceTelemetry = true
         }
         if (state.kneeOffsetVolts != lastLoggedKneeOffset) {
@@ -433,7 +424,7 @@ class MainActivity : ComponentActivity() {
                     opsBurstLogging = true
                     opsBurstStableSinceMs = 0L
                     addControllerEvent(
-                        "VTune down probe ${"%+.2f".format(delta)}V -> ${"%.2f".format(state.targetPvVolts)}V target"
+                        "Floor down probe ${"%+.2f".format(delta)}V -> ${"%.2f".format(state.targetPvVolts)}V floor"
                     )
                 } else {
                     addControllerEvent(
@@ -473,7 +464,7 @@ class MainActivity : ComponentActivity() {
             opsBurstStableSinceMs = 0L
             return
         }
-        if (control.kneeProbeFast || control.vtuneProbePhase == "WaitLock" || control.vtuneProbePhase == "Pause") {
+        if (control.kneeProbeFast || control.floorProbePhase == "WaitLock" || control.floorProbePhase == "Pause") {
             opsBurstLogging = true
             opsBurstStableSinceMs = 0L
             return
@@ -497,7 +488,7 @@ class MainActivity : ComponentActivity() {
         return control.enabled &&
             control.pvMode == "Tracking" &&
             !control.recoveryActive &&
-            control.controlBand == "FI" &&
+            control.controlBand == "MP" &&
             abs(control.vinErrorVolts) <= OPS_STABLE_VIN_ERROR_V
     }
 
@@ -591,13 +582,12 @@ class MainActivity : ComponentActivity() {
                 ridenConnected = ridenUsbState.connected,
                 bmsConnected = bmsBleState.connectedDeviceAddress != null,
                 kneeProbeFast = control.kneeProbeFast,
-                vtuneProbePhase = control.vtuneProbePhase,
+                floorProbePhase = control.floorProbePhase,
                 huntLockTicks = control.huntLockTicks,
                 ridenPinEstW = ridenPinEst,
                 ridenPoutW = ridenPout,
-                acceptedProbePinW = control.acceptedProbePinWatts,
-                vtuneDescentBlocked = control.vtuneDescentBlocked,
-                powerBasedVtuneStop = appSettings.powerBasedVtuneStop
+                mppWantsLowerFloor = control.mppWantsLowerFloor,
+                mppDirection = control.mppDirection
             )
         )
         maybeCheckLogStorage(nowMs)
@@ -605,14 +595,14 @@ class MainActivity : ComponentActivity() {
 
     private fun opsTelemetryIntervalMs(control: MpptControlState): Long {
         if (opsBurstLogging || control.recoveryActive || control.pvMode == "Recover" ||
-            control.kneeProbeFast || control.vtuneProbePhase == "WaitLock" || control.vtuneProbePhase == "Pause"
+            control.kneeProbeFast || control.floorProbePhase == "WaitLock" || control.floorProbePhase == "Pause"
         ) {
             return OPS_SAMPLE_BURST_MS
         }
         if (!control.enabled) return OPS_SAMPLE_IDLE_MS
         return when (control.controlBand) {
             "HU", "FA", "MD" -> OPS_SAMPLE_AGGRESSIVE_MS
-            "NE" -> OPS_SAMPLE_NEAR_MS
+            "NE", "MP" -> OPS_SAMPLE_NEAR_MS
             "FI" -> OPS_SAMPLE_STABLE_MS
             else -> OPS_SAMPLE_OTHER_MS
         }
@@ -742,10 +732,6 @@ class MainActivity : ComponentActivity() {
                 KEY_FAST_ACQUIRE_SUCCESS_COUNT,
                 defaults.fastAcquireSuccessCount
             ).coerceIn(1, 5),
-            powerBasedVtuneStop = prefs.getBoolean(
-                KEY_POWER_BASED_VTUNE_STOP,
-                defaults.powerBasedVtuneStop
-            ),
             controllerLoopMs = prefs.getInt(KEY_CONTROLLER_LOOP_MS, defaults.controllerLoopMs),
             keepScreenOn = prefs.getBoolean(KEY_KEEP_SCREEN_ON, defaults.keepScreenOn)
         )
@@ -768,7 +754,6 @@ class MainActivity : ComponentActivity() {
             putFloat(KEY_KNEE_STEP_V, settings.kneeStepVolts.toFloat())
             putFloat(KEY_KNEE_TRACKING_DELAY_S, settings.kneeTrackingDelaySeconds.toFloat())
             putInt(KEY_FAST_ACQUIRE_SUCCESS_COUNT, settings.fastAcquireSuccessCount.coerceIn(1, 5))
-            putBoolean(KEY_POWER_BASED_VTUNE_STOP, settings.powerBasedVtuneStop)
             putInt(KEY_CONTROLLER_LOOP_MS, settings.controllerLoopMs)
             putBoolean(KEY_KEEP_SCREEN_ON, settings.keepScreenOn)
         }
@@ -1072,7 +1057,6 @@ class MainActivity : ComponentActivity() {
         private const val KEY_HCC_QUIET_S = "hcc_quiet_s"
         private const val KEY_KNEE_TRACKING_DELAY_S = "knee_tracking_delay_s"
         private const val KEY_FAST_ACQUIRE_SUCCESS_COUNT = "fast_acquire_success_count"
-        private const val KEY_POWER_BASED_VTUNE_STOP = "power_based_vtune_stop"
         private const val KEY_CONTROLLER_LOOP_MS = "controller_loop_ms"
         private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
         private const val KEY_ENERGY_DAY_KEY = "energy_day_key"

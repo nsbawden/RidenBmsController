@@ -43,13 +43,12 @@ data class OpsTelemetrySample(
     val ridenConnected: Boolean,
     val bmsConnected: Boolean,
     val kneeProbeFast: Boolean = false,
-    val vtuneProbePhase: String = "--",
+    val floorProbePhase: String = "--",
     val huntLockTicks: Int = 0,
     val ridenPinEstW: Double = 0.0,
     val ridenPoutW: Double = 0.0,
-    val acceptedProbePinW: Double = 0.0,
-    val vtuneDescentBlocked: Boolean = false,
-    val powerBasedVtuneStop: Boolean = false
+    val mppWantsLowerFloor: Boolean = false,
+    val mppDirection: String = "--"
 )
 
 class OpsLogger(baseDir: File) {
@@ -58,7 +57,7 @@ class OpsLogger(baseDir: File) {
 
     fun logTelemetry(sample: OpsTelemetrySample) {
         val file = telemetryFileFor(sample.timestampMs)
-        ensureHeader(file, TELEMETRY_HEADER)
+        ensureHeader(file, TELEMETRY_HEADER_V4)
         file.appendText(sample.toCsvLine() + "\n")
     }
 
@@ -78,7 +77,8 @@ class OpsLogger(baseDir: File) {
             byDay[dateLabel] = when {
                 file.name.endsWith("_telemetry.csv") ||
                     file.name.endsWith("_telemetry_v2.csv") ||
-                    file.name.endsWith("_telemetry_v3.csv") ->
+                    file.name.endsWith("_telemetry_v3.csv") ||
+                    file.name.endsWith("_telemetry_v4.csv") ->
                     current.copy(telemetryBytes = current.telemetryBytes + file.length())
                 file.name.endsWith("_events.csv") ->
                     current.copy(eventsBytes = current.eventsBytes + file.length())
@@ -116,6 +116,9 @@ class OpsLogger(baseDir: File) {
             }
             if (!header.contains("power_based_vtune_stop")) {
                 return File(logDir, "${day}_telemetry_v3.csv")
+            }
+            if (!header.contains("mpp_wants_lower_floor")) {
+                return File(logDir, "${day}_telemetry_v4.csv")
             }
         }
         return legacy
@@ -160,13 +163,12 @@ class OpsLogger(baseDir: File) {
             if (ridenConnected) 1 else 0,
             if (bmsConnected) 1 else 0,
             if (kneeProbeFast) 1 else 0,
-            vtuneProbePhase,
+            floorProbePhase,
             huntLockTicks,
             ridenPinEstW,
             ridenPoutW,
-            acceptedProbePinW,
-            if (vtuneDescentBlocked) 1 else 0,
-            if (powerBasedVtuneStop) 1 else 0
+            if (mppWantsLowerFloor) 1 else 0,
+            mppDirection
         ).joinToString(",")
     }
 
@@ -175,13 +177,13 @@ class OpsLogger(baseDir: File) {
         const val STORAGE_WARN_BYTES = 50L * 1024L * 1024L
         private val DATE_PATTERN = Regex("\\d{4}-\\d{2}-\\d{2}")
 
-        const val TELEMETRY_HEADER =
+        const val TELEMETRY_HEADER_V4 =
             "timestamp_ms,pv_mode,control_band,recovery_phase,recovery_cycle_count," +
                 "target_pv_v,knee_offset_v,vin_error_v,command_iset_a,control_step_a,policy_limit_a," +
                 "riden_vin_v,riden_vout_v,riden_iout_a,riden_watts_w," +
                 "battery_v,battery_a,battery_w,soc_pct,temp_f,riden_connected,bms_connected," +
-                "knee_probe_fast,vtune_probe_phase,hunt_lock_ticks,riden_pin_est_w,riden_pout_w," +
-                "accepted_probe_pin_w,vtune_descent_blocked,power_based_vtune_stop"
+                "knee_probe_fast,floor_probe_phase,hunt_lock_ticks,riden_pin_est_w,riden_pout_w," +
+                "mpp_wants_lower_floor,mpp_direction"
 
         const val EVENTS_HEADER = "timestamp_ms,event"
 
