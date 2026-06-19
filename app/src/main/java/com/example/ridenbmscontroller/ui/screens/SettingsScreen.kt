@@ -37,12 +37,16 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.example.ridenbmscontroller.model.AppSettings
 import com.example.ridenbmscontroller.model.EnergyCounters
+import com.example.ridenbmscontroller.model.RidenState
+import com.example.ridenbmscontroller.ui.formatRidenTempF
+import com.example.ridenbmscontroller.ui.ridenInternalTempColor
 import com.example.ridenbmscontroller.ui.theme.Panel
 import com.example.ridenbmscontroller.ui.theme.TextMuted
 
 @Composable
 fun SettingsScreen(
     settings: AppSettings,
+    riden: RidenState,
     energy: EnergyCounters,
     onSettingsChanged: (AppSettings) -> Unit,
     balanceDayToday: Boolean,
@@ -144,6 +148,22 @@ fun SettingsScreen(
         SettingsGroup("Devices") {
             SettingRow("Riden connection", "USB serial")
             SettingRow("Battery BMS", "Xiaoxiang / JBD BLE")
+            val ridenTempColor = ridenInternalTempColor(riden.internalTempF)
+            SettingRow(
+                label = "Riden internal temp",
+                value = if (riden.internalTempF != null) {
+                    "${formatRidenTempF(riden.internalTempF)} °F"
+                } else {
+                    "—"
+                },
+                valueColor = ridenTempColor
+            )
+            SettingRow("Riden OTP limit", "${"%.0f".format(riden.otpLimitF)} °F (80 °C)")
+            SettingRow(
+                label = "Riden OTP status",
+                value = ridenOtpStatusText(riden),
+                valueColor = if (riden.otpTripped) ridenTempColor else null
+            )
             ToggleRow("Auto reconnect", true) {}
             ToggleRow("Keep screen on", settings.keepScreenOn) {
                 onSettingsChanged(settings.copy(keepScreenOn = it))
@@ -174,14 +194,24 @@ private fun SettingsGroup(title: String, content: @Composable ColumnScope.() -> 
 }
 
 @Composable
-private fun SettingRow(label: String, value: String) {
+private fun SettingRow(label: String, value: String, valueColor: androidx.compose.ui.graphics.Color? = null) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
         modifier = Modifier.fillMaxWidth()
     ) {
         Text(label, color = TextMuted)
-        Text(value, fontWeight = FontWeight.SemiBold)
+        Text(value, fontWeight = FontWeight.SemiBold, color = valueColor ?: MaterialTheme.colorScheme.onSurface)
+    }
+}
+
+private fun ridenOtpStatusText(riden: RidenState): String {
+    if (riden.internalTempF == null) return "—"
+    return when {
+        riden.otpTripped && riden.outputOn == false -> "Tripped — output OFF"
+        riden.otpTripped -> "Tripped — over limit"
+        riden.outputOn == true -> "OK — output ON"
+        else -> "OK — output OFF"
     }
 }
 

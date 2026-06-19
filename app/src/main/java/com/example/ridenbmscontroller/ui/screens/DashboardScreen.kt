@@ -53,6 +53,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.ridenbmscontroller.model.AppState
 import com.example.ridenbmscontroller.model.PowerDirection
+import com.example.ridenbmscontroller.ui.formatRidenTempF
+import com.example.ridenbmscontroller.ui.ridenInternalTempColor
 import com.example.ridenbmscontroller.ui.theme.BatteryGreen
 import com.example.ridenbmscontroller.ui.theme.CurrentRose
 import com.example.ridenbmscontroller.ui.theme.Panel
@@ -85,6 +87,7 @@ fun DashboardScreen(
     ) {
         BatteryGaugeCard(state, onSilenceLowSocAlarm)
         RidenPanel(state, onSetActiveKnee)
+        HealthPanel(state)
         ControllerPanel(state)
     }
 }
@@ -361,15 +364,21 @@ private fun RidenPanel(state: AppState, onSetActiveKnee: (Double) -> Unit) {
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 val today = state.energy.whToday.formatWattHours()
-                val yesterday = state.energy.whYesterday.formatWattHours()
                 val kneeDelayS = state.controller.effectiveKneeDelaySeconds
                 val kneeDelayColor = when {
                     kneeDelayS >= state.settings.kneeTrackingDelayMaxSeconds -> WarningOrange
                     kneeDelayS <= state.settings.kneeTrackingDelayMinSeconds -> BatteryGreen
                     else -> VoltageAmber
                 }
+                val ridenTempF = state.riden.internalTempF
                 ValueTile("Wh Today", today.value, today.unit, TextPrimary, Modifier.weight(1f))
-                ValueTile("Wh Yday", yesterday.value, yesterday.unit, TextPrimary, Modifier.weight(1f))
+                ValueTile(
+                    "Riden T",
+                    formatRidenTempF(ridenTempF),
+                    "F",
+                    ridenInternalTempColor(ridenTempF),
+                    Modifier.weight(1f)
+                )
                 ValueTile(
                     "Knee Delay",
                     kneeDelayS.toInt().toString(),
@@ -509,6 +518,50 @@ private fun recoveryTileValue(state: AppState): String {
         "--" -> "Recover"
         else -> state.controller.recoveryPhase
     }
+}
+
+@Composable
+private fun HealthPanel(state: AppState) {
+    Surface(
+        color = Panel,
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text("Health", fontWeight = FontWeight.SemiBold)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val cloudCount = state.dailyHealth.unscheduledCrashesToday
+                ValueTile(
+                    "Cloud Crash",
+                    cloudCount.toString(),
+                    "today",
+                    if (cloudCount > 0) WarningOrange else TextMuted,
+                    Modifier.weight(1f)
+                )
+                ValueTile(
+                    "Min Out A",
+                    formatHealthAmps(state.dailyHealth.minRidenOutputAmpsToday),
+                    "A",
+                    CurrentRose,
+                    Modifier.weight(1f)
+                )
+                ValueTile(
+                    "Max Out A",
+                    formatHealthAmps(state.dailyHealth.maxRidenOutputAmpsToday),
+                    "A",
+                    PowerBlue,
+                    Modifier.weight(1f)
+                )
+            }
+        }
+    }
+}
+
+private fun formatHealthAmps(amps: Double?): String {
+    return amps?.let { "%.2f".format(it) } ?: "—"
 }
 
 @Composable

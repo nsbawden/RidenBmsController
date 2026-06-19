@@ -226,18 +226,25 @@ class RidenUsbMonitor(
     }
 
     private suspend fun readTelemetry(io: ModbusIo): RidenTelemetry {
-        // Riden-specific register block. Values are centi-units in this model.
-        val r = io.readHoldingRegs(SLAVE_ID, REG_BASE, 8)
-        val outputOn = r[7] != 0
+        // RD60xx block 0x0004..0x0012: temps, setpoints, readings, protection, output.
+        val r = io.readHoldingRegs(SLAVE_ID, REG_TELEM_START, REG_TELEM_COUNT)
+        val internalTempF = decodeSignedReading(r[2], r[3])
         return RidenTelemetry(
-            vset = r[0] / 100.0,
-            iset = r[1] / 100.0,
-            vout = r[2] / 100.0,
-            iout = r[3] / 100.0,
-            watts = r[5] / 100.0,
-            vin = r[6] / 100.0,
-            outputOn = outputOn
+            vset = r[4] / 100.0,
+            iset = r[5] / 100.0,
+            vout = r[6] / 100.0,
+            iout = r[7] / 100.0,
+            watts = r[9] / 100.0,
+            vin = r[10] / 100.0,
+            internalTempF = internalTempF,
+            protectionError = r[12],
+            outputOn = r[14] != 0
         )
+    }
+
+    private fun decodeSignedReading(signReg: Int, magnitudeReg: Int): Double {
+        val sign = if (signReg != 0) -1 else 1
+        return sign * magnitudeReg.toDouble()
     }
 
     private fun findDriver(preferredVid: Int?, preferredPid: Int?): UsbSerialDriver? {
@@ -304,7 +311,8 @@ class RidenUsbMonitor(
         private const val VID_WCH = 0x1A86
         private const val PID_CH340 = 0x7523
         private const val SLAVE_ID = 1
-        private const val REG_BASE = 0x0008
+        private const val REG_TELEM_START = 0x0004
+        private const val REG_TELEM_COUNT = 15
         private const val REG_VSET = 0x0008
         private const val REG_ISET = 0x0009
         private const val REG_ON1 = 0x0011

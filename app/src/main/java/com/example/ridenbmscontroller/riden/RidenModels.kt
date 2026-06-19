@@ -7,7 +7,9 @@ data class RidenTelemetry(
     val iout: Double? = null,
     val watts: Double? = null,
     val vin: Double? = null,
-    val outputOn: Boolean? = null
+    val outputOn: Boolean? = null,
+    val internalTempF: Double? = null,
+    val protectionError: Int? = null
 )
 
 data class RidenUsbState(

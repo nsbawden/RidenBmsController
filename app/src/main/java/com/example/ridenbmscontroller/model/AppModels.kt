@@ -34,7 +34,11 @@ data class RidenState(
     val watts: Double,
     val vset: Double,
     val iset: Double,
-    val targetVin: Double
+    val targetVin: Double,
+    val internalTempF: Double? = null,
+    val outputOn: Boolean? = null,
+    val otpLimitF: Double = 176.0,
+    val otpTripped: Boolean = false
 )
 
 data class EnergyCounters(
@@ -71,7 +75,9 @@ data class AlertState(
     val usbAlarmActive: Boolean,
     val lowSocAlarmActive: Boolean,
     val lowSocSilenced: Boolean,
-    val lowSocThresholdPercent: Int
+    val lowSocThresholdPercent: Int,
+    val ridenOtpAlarmActive: Boolean = false,
+    val ridenOtpTempF: Double? = null
 )
 
 data class AppSettings(
@@ -114,6 +120,7 @@ data class AppState(
     val battery: BatteryState,
     val riden: RidenState,
     val energy: EnergyCounters,
+    val dailyHealth: DailyHealthState,
     val controller: ControllerState,
     val alerts: AlertState,
     val settings: AppSettings,
@@ -155,6 +162,7 @@ data class AppState(
                 bmsWhToday = 0.0,
                 bmsWhYesterday = 0.0
             ),
+            dailyHealth = DailyHealthState(),
             controller = ControllerState(
                 enabled = false,
                 pvMode = "Idle",

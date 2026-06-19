@@ -43,13 +43,16 @@ import com.example.ridenbmscontroller.model.AlertState
 import com.example.ridenbmscontroller.model.BatteryState
 import com.example.ridenbmscontroller.model.ChargeMode
 import com.example.ridenbmscontroller.model.ControllerState
+import com.example.ridenbmscontroller.model.DailyHealthState
 import com.example.ridenbmscontroller.model.EnergyCounters
 import com.example.ridenbmscontroller.model.HistoryPoint
+import com.example.ridenbmscontroller.health.DailyHealthStore
 import com.example.ridenbmscontroller.logging.OpsLogger
 import com.example.ridenbmscontroller.logging.OpsLogStorageSummary
 import com.example.ridenbmscontroller.logging.OpsTelemetrySample
 import com.example.ridenbmscontroller.model.PowerDirection
 import com.example.ridenbmscontroller.model.RidenState
+import com.example.ridenbmscontroller.riden.RidenTemp
 import com.example.ridenbmscontroller.riden.RidenUsbMonitor
 import com.example.ridenbmscontroller.riden.RidenUsbState
 import com.example.ridenbmscontroller.ui.screens.DashboardScreen
@@ -109,12 +112,16 @@ class MainActivity : ComponentActivity() {
     private var lastLoggedVtuneProbePhase = "--"
     private var lastLoggedVtuneDescentBlocked = false
     private lateinit var opsLogger: OpsLogger
+    private lateinit var dailyHealthStore: DailyHealthStore
+    private var dailyHealth by mutableStateOf(DailyHealthState())
     private var batteryCurrentAverage = RollingAverageWindow(60_000L)
     private var historyAccumulator = HistoryAccumulator()
     private var hadGoodRidenConnection = false
     private var usbAlarmJob: Job? = null
     private var lowSocAlarmJob: Job? = null
+    private var ridenOtpAlarmJob: Job? = null
     private var lowSocSilenced = false
+    private var ridenOtpDialogDismissed = false
 
     private val requestBlePermissions = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -132,6 +139,9 @@ class MainActivity : ComponentActivity() {
         refreshOpsLogSummary()
         opsLogger.logEvent(System.currentTimeMillis(), "App started")
         loadEnergy()
+        dailyHealthStore = DailyHealthStore(this)
+        dailyHealthStore.load(nowDayKey())
+        dailyHealth = dailyHealthStore.state
         historyPoints = loadHistory()
         lastHistorySampleMs = System.currentTimeMillis()
         applyKeepScreenOn(appSettings.keepScreenOn)
@@ -142,7 +152,14 @@ class MainActivity : ComponentActivity() {
             setIset = { ridenUsbMonitor.setIset(it) },
             onBalanceDayStarted = { markBalanceDayStarted(it) },
             onState = { handleMpptControlState(it) },
-            onEvent = { addControllerEvent(it) }
+            onEvent = { addControllerEvent(it) },
+            onCollapseEntered = { scheduled ->
+                if (!scheduled) {
+                    dailyHealthStore.recordUnscheduledCrash()
+                    dailyHealth = dailyHealthStore.state
+                    addControllerEvent("Cloud crash #${dailyHealth.unscheduledCrashesToday} today")
+                }
+            }
         )
         bmsBleScanner = BmsBleScanner(this) {
             bmsBleState = it
@@ -158,10 +175,12 @@ class MainActivity : ComponentActivity() {
         ridenUsbMonitor = RidenUsbMonitor(this, lifecycleScope) {
             ridenUsbState = it
             historyAccumulator.addRiden(it)
+            updateDailyHealthFromRiden(it.telemetry.iout)
             updateEnergyFromPower(it.telemetry.watts)
             maybeRecordHistory()
             maybeRecordOpsTelemetry()
             updateUsbAlarm(it.connected)
+            updateRidenOtpAlarm(it)
             tickController()
         }
         bmsBleScanner.refresh()
@@ -174,6 +193,7 @@ class MainActivity : ComponentActivity() {
                     appSettings = appSettings,
                     mpptControlState = mpptControlState,
                     energyCounters = energyCounters,
+                    dailyHealth = dailyHealth,
                     historyPoints = historyPoints,
                     controllerEvents = controllerEvents,
                     alertState = alertState,
@@ -225,10 +245,20 @@ class MainActivity : ComponentActivity() {
                         logStorageWarningDismissed = true
                         logStorageWarning = null
                     },
-                    onSilenceLowSocAlarm = { silenceLowSocAlarm() }
+                    onSilenceLowSocAlarm = { silenceLowSocAlarm() },
+                    ridenOtpDialogVisible = alertState.ridenOtpAlarmActive && !ridenOtpDialogDismissed,
+                    onDismissRidenOtpDialog = { dismissRidenOtpDialog() }
                 )
             }
         }
+    }
+
+    private fun updateDailyHealthFromRiden(iout: Double?) {
+        if (dailyHealthStore.rolloverDayIfNeeded(nowDayKey())) {
+            dailyHealth = dailyHealthStore.state
+        }
+        dailyHealthStore.recordRidenOutputAmps(iout)
+        dailyHealth = dailyHealthStore.state
     }
 
     private fun tickController() {
@@ -282,6 +312,68 @@ class MainActivity : ComponentActivity() {
     private fun stopUsbAlarm() {
         usbAlarmJob?.cancel()
         usbAlarmJob = null
+    }
+
+    private fun updateRidenOtpAlarm(usbState: RidenUsbState) {
+        if (!usbState.connected) {
+            ridenOtpDialogDismissed = false
+            stopRidenOtpAlarm()
+            publishAlerts()
+            return
+        }
+
+        val tempF = usbState.telemetry.internalTempF
+        if (!RidenTemp.alarmActive(tempF)) {
+            ridenOtpDialogDismissed = false
+            stopRidenOtpAlarm()
+            publishAlerts()
+            return
+        }
+
+        if (ridenOtpAlarmJob == null) {
+            addControllerEvent(
+                "Riden high temperature: ${"%.0f".format(tempF)}°F (above ${"%.0f".format(RidenTemp.ALARM_ABOVE_F)}°F)"
+            )
+            startRidenOtpAlarmIfNeeded()
+        }
+        publishAlerts()
+    }
+
+    private fun startRidenOtpAlarmIfNeeded() {
+        if (ridenOtpAlarmJob != null) return
+        ridenOtpAlarmJob = lifecycleScope.launch {
+            val tone = try {
+                ToneGenerator(AudioManager.STREAM_ALARM, 100)
+            } catch (_: Exception) {
+                null
+            }
+            try {
+                while (isActive) {
+                    repeat(4) {
+                        try {
+                            tone?.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 250)
+                        } catch (_: Exception) {
+                        }
+                        delay(350)
+                    }
+                    delay(3000)
+                }
+            } finally {
+                try {
+                    tone?.release()
+                } catch (_: Exception) {
+                }
+            }
+        }
+    }
+
+    private fun stopRidenOtpAlarm() {
+        ridenOtpAlarmJob?.cancel()
+        ridenOtpAlarmJob = null
+    }
+
+    private fun dismissRidenOtpDialog() {
+        ridenOtpDialogDismissed = true
     }
 
     private fun updateLowSocAlarm() {
@@ -354,7 +446,9 @@ class MainActivity : ComponentActivity() {
             usbAlarmActive = usbAlarmJob != null,
             lowSocAlarmActive = lowSocActive,
             lowSocSilenced = lowSocActive && lowSocSilenced,
-            lowSocThresholdPercent = appSettings.lowSocAlarmPercent
+            lowSocThresholdPercent = appSettings.lowSocAlarmPercent,
+            ridenOtpAlarmActive = ridenOtpAlarmJob != null,
+            ridenOtpTempF = ridenUsbState.telemetry.internalTempF
         )
     }
 
@@ -852,6 +946,8 @@ class MainActivity : ComponentActivity() {
         val today = nowDayKey()
         if (energyDayKey == 0) energyDayKey = today
         if (rolloverEnergyDayIfNeeded(today)) {
+            dailyHealthStore.rolloverDayIfNeeded(today)
+            dailyHealth = dailyHealthStore.state
             persistEnergy()
         }
     }
@@ -860,6 +956,8 @@ class MainActivity : ComponentActivity() {
         val nowMs = SystemClock.elapsedRealtime()
         val today = nowDayKey()
         if (rolloverEnergyDayIfNeeded(today)) {
+            dailyHealthStore.rolloverDayIfNeeded(today)
+            dailyHealth = dailyHealthStore.state
             lastEnergyMs = nowMs
             lastEnergyWatts = watts
             persistEnergy()
@@ -899,6 +997,8 @@ class MainActivity : ComponentActivity() {
         val nowMs = SystemClock.elapsedRealtime()
         val today = nowDayKey()
         if (rolloverEnergyDayIfNeeded(today)) {
+            dailyHealthStore.rolloverDayIfNeeded(today)
+            dailyHealth = dailyHealthStore.state
             lastBmsEnergyMs = nowMs
             lastBmsEnergyWatts = watts
             persistEnergy()
@@ -1074,6 +1174,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         stopUsbAlarm()
         stopLowSocAlarm()
+        stopRidenOtpAlarm()
         bmsBleScanner.stopScan()
         ridenUsbMonitor.stop()
         persistEnergy()
@@ -1300,6 +1401,7 @@ private fun RidenBmsApp(
     appSettings: AppSettings,
     mpptControlState: MpptControlState,
     energyCounters: EnergyCounters,
+    dailyHealth: DailyHealthState,
     historyPoints: List<HistoryPoint>,
     controllerEvents: List<String>,
     alertState: AlertState,
@@ -1321,7 +1423,9 @@ private fun RidenBmsApp(
     onDeleteOpsLogsBeforeDate: (String) -> String,
     onRefreshOpsLogSummary: () -> Unit,
     onDismissLogStorageWarning: () -> Unit,
-    onSilenceLowSocAlarm: () -> Unit
+    onSilenceLowSocAlarm: () -> Unit,
+    ridenOtpDialogVisible: Boolean,
+    onDismissRidenOtpDialog: () -> Unit
 ) {
     val state = remember(
         bmsBleState,
@@ -1329,6 +1433,7 @@ private fun RidenBmsApp(
         appSettings,
         mpptControlState,
         energyCounters,
+        dailyHealth,
         historyPoints,
         controllerEvents,
         alertState,
@@ -1338,6 +1443,7 @@ private fun RidenBmsApp(
         AppState.preview.copy(
             settings = appSettings,
             energy = energyCounters,
+            dailyHealth = dailyHealth,
             history = historyPoints,
             events = controllerEvents,
             alerts = alertState,
@@ -1358,6 +1464,33 @@ private fun RidenBmsApp(
             text = { Text(logStorageWarning) },
             confirmButton = {
                 TextButton(onClick = onDismissLogStorageWarning) {
+                    Text("Dismiss")
+                }
+            }
+        )
+    }
+
+    if (ridenOtpDialogVisible) {
+        val tempText = state.alerts.ridenOtpTempF?.let { "%.0f°F".format(it) } ?: "—"
+        AlertDialog(
+            onDismissRequest = onDismissRidenOtpDialog,
+            title = { Text("Riden Over-Temperature") },
+            text = {
+                Text(
+                    buildString {
+                        append("Internal temperature $tempText exceeds the ")
+                        append("${"%.0f".format(RidenTemp.ALARM_ABOVE_F)}°F warning threshold.")
+                        if (state.riden.otpTripped) {
+                            append(" Hardware OTP tripped at ")
+                            append("${"%.0f".format(state.riden.otpLimitF)}°F and output is off.")
+                        } else {
+                            append(" Reduce load and allow the unit to cool.")
+                        }
+                    }
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = onDismissRidenOtpDialog) {
                     Text("Dismiss")
                 }
             }
@@ -1400,6 +1533,7 @@ private fun RidenBmsApp(
                 )
                 AppTab.Settings -> SettingsScreen(
                     settings = state.settings,
+                    riden = state.riden,
                     energy = state.energy,
                     onSettingsChanged = onSettingsChanged,
                     balanceDayToday = balanceDayToday,
@@ -1446,7 +1580,11 @@ private fun AppState.withMpptControl(control: MpptControlState): AppState {
 
 private fun AppState.withRidenTelemetry(usbState: RidenUsbState): AppState {
     val telemetry = usbState.telemetry
-    val liveRiden = if (telemetry.vin != null || telemetry.vout != null) {
+    val hasLiveValues = telemetry.vin != null ||
+        telemetry.vout != null ||
+        telemetry.internalTempF != null
+    val liveRiden = if (usbState.connected && hasLiveValues) {
+        val tempF = telemetry.internalTempF
         RidenState(
             vin = telemetry.vin ?: riden.vin,
             vout = telemetry.vout ?: riden.vout,
@@ -1454,7 +1592,11 @@ private fun AppState.withRidenTelemetry(usbState: RidenUsbState): AppState {
             watts = telemetry.watts ?: riden.watts,
             vset = telemetry.vset ?: riden.vset,
             iset = telemetry.iset ?: riden.iset,
-            targetVin = riden.targetVin
+            targetVin = riden.targetVin,
+            internalTempF = tempF,
+            outputOn = telemetry.outputOn,
+            otpLimitF = RidenTemp.OTP_LIMIT_F,
+            otpTripped = RidenTemp.otpTripped(tempF)
         )
     } else {
         riden

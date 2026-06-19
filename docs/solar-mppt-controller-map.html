@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Solar MPPT Controller Map</title>
+  <style>
+    :root {
+      --bg: #1a1b1e;
+      --surface: #25262b;
+      --surface-alt: #2c2e33;
+      --border: #3d3f45;
+      --text: #e8e8ea;
+      --muted: #9a9aa3;
+      --accent: #4c8bf5;
+      --accent-dim: rgba(76, 139, 245, 0.15);
+      --warn: #e8a838;
+      --warn-dim: rgba(232, 168, 56, 0.15);
+      --ok: #5cb85c;
+      --ok-dim: rgba(92, 184, 92, 0.15);
+      --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+      font-size: 15px;
+    }
+
+    .wrap {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 24px 20px 48px;
+    }
+
+    h1 {
+      font-size: 1.75rem;
+      font-weight: 600;
+      margin: 0 0 8px;
+    }
+
+    .subtitle { color: var(--muted); margin: 0 0 24px; }
+
+    h2 {
+      font-size: 1.15rem;
+      font-weight: 600;
+      margin: 0 0 4px;
+    }
+
+    h3 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin: 16px 0 8px;
+    }
+
+    .section-sub { color: var(--muted); font-size: 0.9rem; margin: 0 0 12px; }
+
+    .callout {
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
+      background: var(--surface);
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin-bottom: 20px;
+    }
+
+    .callout strong { color: var(--text); }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 16px;
+      overflow: hidden;
+    }
+
+    .card-head {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .card-body { padding: 16px; }
+
+    details {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 12px;
+    }
+
+    details[open] { margin-bottom: 16px; }
+
+    summary {
+      cursor: pointer;
+      padding: 14px 16px;
+      font-weight: 600;
+      list-style: none;
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+    }
+
+    summary::-webkit-details-marker { display: none; }
+
+    summary::before {
+      content: "▸";
+      color: var(--muted);
+      font-size: 0.85em;
+      transition: transform 0.15s;
+    }
+
+    details[open] summary::before { transform: rotate(90deg); }
+
+    .details-inner { padding: 0 16px 16px; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.92rem;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--muted);
+      font-weight: 500;
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+
+    tr:last-child td { border-bottom: none; }
+
+    code, .band {
+      font-family: var(--mono);
+      font-size: 0.88em;
+      background: var(--surface-alt);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+
+    .pill {
+      display: inline-block;
+      font-size: 0.78rem;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 999px;
+      white-space: nowrap;
+      vertical-align: middle;
+    }
+
+    .pill-warn { background: var(--warn-dim); color: var(--warn); }
+    .pill-ok { background: var(--ok-dim); color: var(--ok); }
+
+    .tier-row {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+      margin-bottom: 12px;
+    }
+
+    .tier-row p { margin: 0; flex: 1; }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    @media (max-width: 640px) {
+      .two-col { grid-template-columns: 1fr; }
+    }
+
+    .list-plain {
+      margin: 0;
+      padding-left: 1.2em;
+    }
+
+    .list-plain li { margin-bottom: 6px; }
+
+    .flow {
+      overflow-x: auto;
+      padding: 8px 0;
+    }
+
+    .flow svg { display: block; margin: 0 auto; max-width: 100%; }
+
+    .node { fill: var(--surface-alt); stroke: var(--border); }
+    .node-root { fill: var(--accent); stroke: var(--accent); }
+    .node-branch { fill: #2a3344; stroke: var(--border); }
+    .node-text { fill: var(--text); font-size: 11px; font-family: var(--font); }
+    .node-text-root { fill: #fff; font-weight: 600; }
+    .edge { stroke: var(--border); stroke-width: 1.5; fill: none; }
+
+    footer {
+      margin-top: 32px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Solar MPPT Controller Map</h1>
+    <p class="subtitle">
+      Reference for what happens when. Source: <code>SolarMpptController.kt</code>.
+      Open this file in any browser — no server required.
+    </p>
+
+    <div class="callout">
+      <strong>Reference</strong> (this page) — what each mode means and how they connect.<br />
+      <strong>Live</strong> (phone Dashboard) — current mode, band, knee, recovery. Many fields are
+      published in <code>MpptControlState</code> but not yet shown on the Dashboard.
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Tick decision flow</h2>
+        <p class="section-sub">Every controller loop — <code>tick()</code> chooses one path</p>
+      </div>
+      <div class="card-body flow">
+        <svg width="520" height="720" viewBox="0 0 520 720" aria-label="Controller tick decision flow">
+          <defs>
+            <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+              <path d="M0,0 L6,3 L0,6 Z" fill="#3d3f45" />
+            </marker>
+          </defs>
+
+          <!-- tick -->
+          <rect class="node-root" x="186" y="24" width="148" height="40" rx="6" />
+          <text class="node-text node-text-root" x="260" y="49" text-anchor="middle">Controller tick</text>
+
+          <!-- row 1 branches -->
+          <line class="edge" x1="260" y1="64" x2="80" y2="100" marker-end="url(#arrow)" />
+          <line class="edge" x1="260" y1="64" x2="200" y2="100" marker-end="url(#arrow)" />
+          <line class="edge" x1="260" y1="64" x2="320" y2="100" marker-end="url(#arrow)" />
+          <line class="edge" x1="260" y1="64" x2="440" y2="100" marker-end="url(#arrow)" />
+
+          <rect class="node" x="6" y="100" width="148" height="36" rx="6" />
+          <text class="node-text" x="80" y="123" text-anchor="middle">Idle / Off</text>
+
+          <rect class="node" x="126" y="100" width="148" height="36" rx="6" />
+          <text class="node-text" x="200" y="123" text-anchor="middle">Alarm hold</text>
+
+          <rect class="node" x="246" y="100" width="148" height="36" rx="6" />
+          <text class="node-text" x="320" y="123" text-anchor="middle">Recover (ongoing)</text>
+
+          <rect class="node" x="366" y="100" width="148" height="36" rx="6" />
+          <text class="node-text" x="440" y="123" text-anchor="middle">SOC / V limit</text>
+
+          <!-- track path -->
+          <line class="edge" x1="260" y1="64" x2="260" y2="168" marker-end="url(#arrow)" />
+          <rect class="node" x="186" y="168" width="148" height="36" rx="6" />
+          <text class="node-text" x="260" y="191" text-anchor="middle">Track knee</text>
+
+          <!-- collapse from track -->
+          <line class="edge" x1="260" y1="204" x2="80" y2="248" marker-end="url(#arrow)" />
+          <rect class="node" x="6" y="248" width="148" height="36" rx="6" />
+          <text class="node-text" x="80" y="271" text-anchor="middle">Enter recovery</text>
+          <line class="edge" x1="80" y1="284" x2="320" y2="136" stroke-dasharray="4 3" marker-end="url(#arrow)" />
+
+          <!-- power tier -->
+          <line class="edge" x1="260" y1="204" x2="120" y2="320" marker-end="url(#arrow)" />
+          <line class="edge" x1="260" y1="204" x2="400" y2="320" marker-end="url(#arrow)" />
+
+          <rect class="node-branch" x="46" y="320" width="148" height="44" rx="6" />
+          <text class="node-text" x="120" y="340" text-anchor="middle">Low power</text>
+          <text class="node-text" x="120" y="355" text-anchor="middle">&lt;70 W dwell</text>
+
+          <rect class="node-branch" x="326" y="320" width="148" height="44" rx="6" />
+          <text class="node-text" x="400" y="340" text-anchor="middle">High power</text>
+          <text class="node-text" x="400" y="355" text-anchor="middle">≥80 W dwell</text>
+
+          <line class="edge" x1="120" y1="364" x2="120" y2="408" marker-end="url(#arrow)" />
+          <line class="edge" x1="400" y1="364" x2="400" y2="408" marker-end="url(#arrow)" />
+
+          <rect class="node-branch" x="46" y="408" width="148" height="44" rx="6" />
+          <text class="node-text" x="120" y="428" text-anchor="middle">Shade hunt</text>
+          <text class="node-text" x="120" y="443" text-anchor="middle">SH band</text>
+
+          <rect class="node-branch" x="326" y="408" width="148" height="44" rx="6" />
+          <text class="node-text" x="400" y="428" text-anchor="middle">Classic hunt</text>
+          <text class="node-text" x="400" y="443" text-anchor="middle">FI – HU</text>
+
+          <!-- vtune -->
+          <line class="edge" x1="260" y1="204" x2="260" y2="500" marker-end="url(#arrow)" />
+          <rect class="node" x="186" y="500" width="148" height="36" rx="6" />
+          <text class="node-text" x="260" y="523" text-anchor="middle">VTune down-probes</text>
+
+          <line class="edge" x1="260" y1="536" x2="260" y2="580" marker-end="url(#arrow)" />
+          <rect class="node" x="186" y="580" width="148" height="36" rx="6" />
+          <text class="node-text" x="260" y="603" text-anchor="middle">Fast acquire</text>
+          <text class="node-text" x="260" y="640" text-anchor="middle" fill="#9a9aa3" font-size="10">high power only</text>
+
+          <line class="edge" x1="320" y1="136" x2="260" y2="168" stroke-dasharray="4 3" marker-end="url(#arrow)" />
+          <text class="node-text" x="268" y="158" fill="#9a9aa3" font-size="10">resume tracking</text>
+        </svg>
+      </div>
+    </div>
+
+    <details open>
+      <summary>
+        <span>Top-level modes (<code>pvMode</code>)</span>
+      </summary>
+      <div class="details-inner">
+        <p class="section-sub">What the Mode chip on the Dashboard shows</p>
+        <table>
+          <thead>
+            <tr><th>Mode</th><th>When</th><th>What it does</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="band">Tracking</span></td>
+              <td>Normal solar — hunting Vin at learned knee</td>
+              <td>ISET steps by band; periodic VTune down-probes; low vs high power branch</td>
+            </tr>
+            <tr>
+              <td><span class="band">Recover</span></td>
+              <td>Vin collapsed below knee threshold</td>
+              <td>Drop ISET, raise knee (or soft-lower in shade); wait for Vin; ramp back</td>
+            </tr>
+            <tr>
+              <td><span class="band">SOC Hold</span></td>
+              <td>SOC ≥ target</td>
+              <td>BMS net-current P-control at knee — solar carries loads</td>
+            </tr>
+            <tr>
+              <td><span class="band">Voltage Limit</span></td>
+              <td>Vout at max charge voltage</td>
+              <td>Same hold logic as SOC ceiling</td>
+            </tr>
+            <tr>
+              <td><span class="band">Balance</span></td>
+              <td>Balance day + SOC reached</td>
+              <td>100% target, hold at knee</td>
+            </tr>
+            <tr>
+              <td><span class="band">Alarm</span></td>
+              <td>BMS charge-blocking alarm</td>
+              <td>Output off, exponential backoff retry</td>
+            </tr>
+            <tr>
+              <td><span class="band">Idle</span></td>
+              <td>Controller off or BMS missing</td>
+              <td>No commands</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </details>
+
+    <details open>
+      <summary>
+        <span>Power tier (inside Tracking)</span>
+      </summary>
+      <div class="details-inner">
+        <p class="section-sub">Gates shade logic vs high-sun hunt</p>
+        <div class="tier-row">
+          <span class="pill pill-warn">Low power</span>
+          <p>
+            Pout &lt; 70 W for 20 s of <strong>tracking ticks only</strong> (recovery excluded).
+            Enables SH band, Pin decline, soft VTune, shade-collapse knee lower. No fast acquire.
+          </p>
+        </div>
+        <div class="tier-row">
+          <span class="pill pill-ok">High power</span>
+          <p>
+            Pout ≥ 80 W for 5 s of tracking ticks. Classic FI–HU hunt only. Fast acquire and
+            knee-delay ladder active.
+          </p>
+        </div>
+        <p style="color: var(--muted); font-size: 0.9rem; margin: 0;">
+          Hysteresis band 70–80 W holds current tier. Mode sampling pauses during recovery cycles.
+        </p>
+      </div>
+    </details>
+
+    <details>
+      <summary>
+        <span>Hunt bands (<code>controlBand</code> chip)</span>
+      </summary>
+      <div class="details-inner">
+        <p class="section-sub">How ISET step size is chosen from |Vin − VTune|</p>
+        <table>
+          <thead>
+            <tr><th>Band</th><th>|Vin−VTune|</th><th>Step</th><th>Meaning</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><span class="band">FI</span></td><td>≤ 0.25 V</td><td>0.01 A</td><td>On knee — ISET held</td></tr>
+            <tr><td><span class="band">NE</span></td><td>0.25–0.5 V</td><td>0.05 A</td><td>Near knee — fine steps</td></tr>
+            <tr><td><span class="band">MD</span></td><td>0.5–1.0 V</td><td>0.10 A</td><td>Mid error — medium steps</td></tr>
+            <tr><td><span class="band">FA</span></td><td>1.0–2.0 V</td><td>0.25 A</td><td>Far — ramp ISET faster</td></tr>
+            <tr><td><span class="band">HU</span></td><td>&gt; 2.0 V</td><td>scaled</td><td>Huge Voc gap — big steps</td></tr>
+            <tr><td><span class="band">SH</span></td><td>shade</td><td>capped</td><td>Low power only — Voc trap, stall, wrong-way backoff</td></tr>
+            <tr><td><span class="band">RE</span></td><td>recover</td><td>—</td><td>Collapse recovery active</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </details>
+
+    <details>
+      <summary>
+        <span>VTune / probe subsystem</span>
+      </summary>
+      <div class="details-inner">
+        <p class="section-sub">Mostly hidden from Dashboard — see Tools → Events</p>
+        <h3>Probe pacing (<code>vtuneProbePhase</code>)</h3>
+        <table>
+          <thead>
+            <tr><th>Phase</th><th>Meaning</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><span class="band">--</span></td><td>Idle — normal maintenance delay between down-probes</td></tr>
+            <tr><td><span class="band">WaitLock</span></td><td>After down-probe — wait for FI hunt lock (3 ticks)</td></tr>
+            <tr><td><span class="band">Pause</span></td><td>Hunt locked — soak before power check or next probe</td></tr>
+            <tr><td><span class="band">Blocked</span></td><td>Power dropped after probe — VTune descent blocked, reverted</td></tr>
+          </tbody>
+        </table>
+        <h3>Related flags</h3>
+        <ul class="list-plain">
+          <li><strong>kneeProbeFast</strong> — rapid down-probes after N stable maintenance downshifts (high power only)</li>
+          <li><strong>effectiveKneeDelaySeconds</strong> — minutes between maintenance probes; climbs after clean periods, snaps to min on unscheduled collapse</li>
+          <li><strong>probe-refuzz session</strong> — probe-caused collapse; knee delay unchanged; ends after stable FI hold</li>
+          <li><strong>vtuneDescentBlocked</strong> — Pin dropped after probe; last step reverted</li>
+        </ul>
+      </div>
+    </details>
+
+    <details>
+      <summary>
+        <span>Recovery (collapse)</span>
+      </summary>
+      <div class="details-inner">
+        <p class="section-sub">Recover tile + <code>recoveryCycleCount</code></p>
+        <ol class="list-plain">
+          <li>Triggered when Vin falls below knee collapse threshold during tracking</li>
+          <li>Drop ISET (severe → MIN_ISET)</li>
+          <li>Knee action — raise (default) or soft-lower if low power + Pin declining (shade)</li>
+          <li><code>PHASE_WAIT_VIN</code> until Vin near knee again</li>
+          <li>Ramp ISET back toward last working value</li>
+        </ol>
+        <p style="color: var(--muted); font-size: 0.9rem;">
+          Unscheduled collapse resets knee delay to min. Probe-caused collapse may start refuzz session instead.
+        </p>
+      </div>
+    </details>
+
+    <details>
+      <summary>
+        <span>Dashboard vs hidden telemetry</span>
+      </summary>
+      <div class="details-inner">
+        <div class="two-col">
+          <div class="card" style="margin: 0;">
+            <div class="card-head"><h2 style="font-size: 1rem;">Shown on Dashboard</h2></div>
+            <div class="card-body">
+              <ul class="list-plain">
+                <li>pvMode, status</li>
+                <li>controlBand + step</li>
+                <li>knee, Vin error, offset</li>
+                <li>command ISET</li>
+                <li>recovery phase / cycle</li>
+                <li>effective knee delay</li>
+                <li>Pout (Riden watts)</li>
+              </ul>
+            </div>
+          </div>
+          <div class="card" style="margin: 0;">
+            <div class="card-head"><h2 style="font-size: 1rem;">Published but hidden</h2></div>
+            <div class="card-body" style="color: var(--muted);">
+              <ul class="list-plain">
+                <li>lowPowerMode</li>
+                <li>kneeProbeFast</li>
+                <li>vtuneProbePhase</li>
+                <li>huntLockTicks</li>
+                <li>estimatedPinWatts</li>
+                <li>vtuneDescentBlocked</li>
+                <li>pastMpp* (8 fields)</li>
+                <li>acceptedProbePinWatts</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <div class="callout" style="border-left-color: var(--muted);">
+      <strong>Example — high sun at ~97 W</strong><br />
+      Tracking → High power → Classic hunt (FI/NE) → VTune on maintenance delay timer.
+      No SH band, no fast acquire unless you recently had stable maintenance downshifts.
+    </div>
+
+    <footer>
+      RidenBmsController · <code>docs/solar-mppt-controller-map.html</code> ·
+      Regenerate when controller behavior changes.
+    </footer>
+  </div>
+</body>
+</html>
