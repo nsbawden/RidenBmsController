@@ -134,8 +134,8 @@ private fun TuningTool(state: AppState) {
     val targetReached = state.battery.socPercent >= state.controller.socTargetPercent
     val guidance = when {
         !state.controller.enabled -> "Controller is off."
-        !state.controller.bmsConnected -> "Waiting for BMS telemetry."
         !state.controller.ridenConnected -> "Waiting for Riden telemetry."
+        !state.controller.bmsConnected -> "BMS offline: controller uses voltage fallback; SOC hold tuning is unavailable."
         state.controller.pvMode == "Alarm" -> "Charging is inhibited by BMS alarm handling."
         state.controller.recoveryActive -> "Solar recovery is active; SOC hold tuning is secondary right now."
         targetReached && inDeadband -> "No tuning change suggested. BMS current is inside the configured near-zero deadband, so small real currents may be hidden by BMS resolution."
@@ -239,6 +239,8 @@ private fun OpsLogsTool(
                     Text(
                         text = "${day.dateLabel}  telemetry ${OpsLogger.formatSize(day.telemetryBytes)}  " +
                             "events ${OpsLogger.formatSize(day.eventsBytes)}  " +
+                            "sky ${OpsLogger.formatSize(day.skyBytes)}  " +
+                            "crash ${OpsLogger.formatSize(day.crashBytes)}  " +
                             "total ${OpsLogger.formatSize(day.totalBytes)}",
                         color = TextMuted,
                         fontFamily = FontFamily.Monospace,

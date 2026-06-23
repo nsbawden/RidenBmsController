@@ -46,7 +46,10 @@ import com.example.ridenbmscontroller.model.ControllerState
 import com.example.ridenbmscontroller.model.DailyHealthState
 import com.example.ridenbmscontroller.model.EnergyCounters
 import com.example.ridenbmscontroller.model.HistoryPoint
+import com.example.ridenbmscontroller.health.CrashLogStore
 import com.example.ridenbmscontroller.health.DailyHealthStore
+import com.example.ridenbmscontroller.health.SkyDisturbanceSnapshot
+import com.example.ridenbmscontroller.health.SkyDisturbanceStore
 import com.example.ridenbmscontroller.logging.OpsLogger
 import com.example.ridenbmscontroller.logging.OpsLogStorageSummary
 import com.example.ridenbmscontroller.logging.OpsTelemetrySample
@@ -113,6 +116,8 @@ class MainActivity : ComponentActivity() {
     private var lastLoggedVtuneDescentBlocked = false
     private lateinit var opsLogger: OpsLogger
     private lateinit var dailyHealthStore: DailyHealthStore
+    private lateinit var skyDisturbanceStore: SkyDisturbanceStore
+    private lateinit var crashLogStore: CrashLogStore
     private var dailyHealth by mutableStateOf(DailyHealthState())
     private var batteryCurrentAverage = RollingAverageWindow(60_000L)
     private var historyAccumulator = HistoryAccumulator()
@@ -141,7 +146,11 @@ class MainActivity : ComponentActivity() {
         loadEnergy()
         dailyHealthStore = DailyHealthStore(this)
         dailyHealthStore.load(nowDayKey())
-        dailyHealth = dailyHealthStore.state
+        skyDisturbanceStore = SkyDisturbanceStore(this)
+        skyDisturbanceStore.load(nowDayKey(), todayStartMs())
+        crashLogStore = CrashLogStore(this)
+        crashLogStore.load(nowDayKey())
+        refreshDailyHealth()
         historyPoints = loadHistory()
         lastHistorySampleMs = System.currentTimeMillis()
         applyKeepScreenOn(appSettings.keepScreenOn)
@@ -153,12 +162,18 @@ class MainActivity : ComponentActivity() {
             onBalanceDayStarted = { markBalanceDayStarted(it) },
             onState = { handleMpptControlState(it) },
             onEvent = { addControllerEvent(it) },
-            onCollapseEntered = { scheduled ->
-                if (!scheduled) {
-                    dailyHealthStore.recordUnscheduledCrash()
-                    dailyHealth = dailyHealthStore.state
+            onCollapseEntered = { scheduled, preCrash ->
+                if (!scheduled && preCrash != null) {
+                    skyDisturbanceStore.recordDisturbance(preCrash)
+                    refreshDailyHealth()
                     addControllerEvent("Cloud crash #${dailyHealth.unscheduledCrashesToday} today")
                 }
+            },
+            onCrashEpisodeStart = { kind, preCrash, nowMs ->
+                crashLogStore.startEpisode(kind, preCrash, nowMs)
+            },
+            onCrashLogSample = { sample ->
+                crashLogStore.appendSample(sample)
             }
         )
         bmsBleScanner = BmsBleScanner(this) {
@@ -183,7 +198,7 @@ class MainActivity : ComponentActivity() {
             updateRidenOtpAlarm(it)
             tickController()
         }
-        bmsBleScanner.refresh()
+        bmsBleScanner.ensureAutoConnect()
         ridenUsbMonitor.start()
         setContent {
             RidenBmsTheme {
@@ -254,12 +269,32 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun updateDailyHealthFromRiden(iout: Double?) {
-        if (dailyHealthStore.rolloverDayIfNeeded(nowDayKey())) {
-            dailyHealth = dailyHealthStore.state
+        val today = nowDayKey()
+        if (rolloverDailyHealthIfNeeded(today)) {
+            refreshDailyHealth()
         }
+        skyDisturbanceStore.noteRidenOutputAmps(iout, System.currentTimeMillis())
         dailyHealthStore.recordRidenOutputAmps(iout)
-        dailyHealth = dailyHealthStore.state
+        refreshDailyHealth()
     }
+
+    private fun rolloverDailyHealthIfNeeded(today: Int): Boolean {
+        val dayStart = todayStartMs()
+        val healthRolled = dailyHealthStore.rolloverDayIfNeeded(today)
+        val skyRolled = skyDisturbanceStore.rolloverDayIfNeeded(today, dayStart)
+        val crashRolled = crashLogStore.rolloverDayIfNeeded(today)
+        return healthRolled || skyRolled || crashRolled
+    }
+
+    private fun refreshDailyHealth() {
+        val amps = dailyHealthStore.state
+        dailyHealth = amps.copy(
+            unscheduledCrashesToday = skyDisturbanceStore.disturbanceCount,
+            longestCleanGapMs = skyDisturbanceStore.longestCleanGapMs(System.currentTimeMillis())
+        )
+    }
+
+    private fun todayStartMs(): Long = SkyDisturbanceStore.dayStartMs()
 
     private fun tickController() {
         if (!::mpptController.isInitialized) return
@@ -751,7 +786,8 @@ class MainActivity : ComponentActivity() {
         if (!logStorageWarningDismissed) {
             logStorageWarning =
                 "Operational logs are using ${OpsLogger.formatSize(total)}. " +
-                    "Delete older logs from Tools > Logs when you are ready."
+                    "In the MPPT app: bottom bar Tools → Logs tab → Refresh Log Summary, " +
+                    "or run synclogs on your PC."
         }
     }
 
@@ -792,6 +828,9 @@ class MainActivity : ComponentActivity() {
     private fun applyControllerKeepAlive(enabled: Boolean) {
         if (enabled) {
             ControllerKeepAliveService.start(this)
+            if (::bmsBleScanner.isInitialized) {
+                bmsBleScanner.ensureAutoConnect()
+            }
         } else {
             ControllerKeepAliveService.stop(this)
         }
@@ -817,6 +856,13 @@ class MainActivity : ComponentActivity() {
                 KEY_MAX_BATTERY_V,
                 prefs.getFloat(KEY_BALANCE_V, defaults.maxBatteryVolts.toFloat())
             ).toDouble(),
+            bmsOfflineMaxBatteryVolts = prefs.getFloat(
+                KEY_BMS_OFFLINE_MAX_BATTERY_V,
+                prefs.getFloat(
+                    KEY_MAX_BATTERY_V,
+                    prefs.getFloat(KEY_BALANCE_V, defaults.bmsOfflineMaxBatteryVolts.toFloat())
+                )
+            ).toDouble(),
             balanceEveryDays = prefs.getInt(KEY_BALANCE_EVERY_DAYS, defaults.balanceEveryDays),
             lastBalanceEpochDay = prefs.getLong(KEY_LAST_BALANCE_EPOCH_DAY, defaults.lastBalanceEpochDay),
             maxChargeAmps = prefs.getFloat(KEY_MAX_CHARGE_A, defaults.maxChargeAmps.toFloat()).toDouble(),
@@ -841,6 +887,17 @@ class MainActivity : ComponentActivity() {
                 KEY_KNEE_STEP_V,
                 defaults.kneeStepVolts.toFloat()
             ).toDouble(),
+            fastProbeRecoveryKneeBackVolts = prefs.getFloat(
+                KEY_FAST_PROBE_RECOVERY_KNEE_BACK_V,
+                prefs.getFloat(
+                    KEY_PROBE_RECOVERY_KNEE_BACK_V,
+                    defaults.fastProbeRecoveryKneeBackVolts.toFloat()
+                )
+            ).toDouble(),
+            probeRecoveryIsetFraction = prefs.getFloat(
+                KEY_PROBE_RECOVERY_ISET_FRACTION,
+                defaults.probeRecoveryIsetFraction.toFloat()
+            ).toDouble().coerceIn(0.0, 1.0),
             kneeTrackingDelayMinSeconds = prefs.getFloat(
                 KEY_KNEE_TRACKING_DELAY_MIN_S,
                 defaults.kneeTrackingDelayMinSeconds.toFloat()
@@ -879,6 +936,7 @@ class MainActivity : ComponentActivity() {
     private fun saveSettings(settings: AppSettings) {
         getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE).edit {
             putFloat(KEY_MAX_BATTERY_V, settings.maxBatteryVolts.toFloat())
+            putFloat(KEY_BMS_OFFLINE_MAX_BATTERY_V, settings.bmsOfflineMaxBatteryVolts.toFloat())
             putInt(KEY_BALANCE_EVERY_DAYS, settings.balanceEveryDays)
             putLong(KEY_LAST_BALANCE_EPOCH_DAY, settings.lastBalanceEpochDay)
             putFloat(KEY_MAX_CHARGE_A, settings.maxChargeAmps.toFloat())
@@ -891,6 +949,8 @@ class MainActivity : ComponentActivity() {
             putFloat(KEY_MIN_TARGET_PV_V, settings.minTargetPvVolts.toFloat())
             putFloat(KEY_MAX_TARGET_PV_V, settings.maxTargetPvVolts.toFloat())
             putFloat(KEY_KNEE_STEP_V, settings.kneeStepVolts.toFloat())
+            putFloat(KEY_FAST_PROBE_RECOVERY_KNEE_BACK_V, settings.fastProbeRecoveryKneeBackVolts.toFloat())
+            putFloat(KEY_PROBE_RECOVERY_ISET_FRACTION, settings.probeRecoveryIsetFraction.toFloat())
             putFloat(KEY_KNEE_TRACKING_DELAY_MIN_S, settings.kneeTrackingDelayMinSeconds.toFloat())
             putFloat(KEY_KNEE_TRACKING_DELAY_MAX_S, settings.kneeTrackingDelayMaxSeconds.toFloat())
             putInt(KEY_FAST_ACQUIRE_SUCCESS_COUNT, settings.fastAcquireSuccessCount.coerceIn(1, 5))
@@ -946,8 +1006,8 @@ class MainActivity : ComponentActivity() {
         val today = nowDayKey()
         if (energyDayKey == 0) energyDayKey = today
         if (rolloverEnergyDayIfNeeded(today)) {
-            dailyHealthStore.rolloverDayIfNeeded(today)
-            dailyHealth = dailyHealthStore.state
+            rolloverDailyHealthIfNeeded(today)
+            refreshDailyHealth()
             persistEnergy()
         }
     }
@@ -956,8 +1016,8 @@ class MainActivity : ComponentActivity() {
         val nowMs = SystemClock.elapsedRealtime()
         val today = nowDayKey()
         if (rolloverEnergyDayIfNeeded(today)) {
-            dailyHealthStore.rolloverDayIfNeeded(today)
-            dailyHealth = dailyHealthStore.state
+            rolloverDailyHealthIfNeeded(today)
+            refreshDailyHealth()
             lastEnergyMs = nowMs
             lastEnergyWatts = watts
             persistEnergy()
@@ -997,8 +1057,8 @@ class MainActivity : ComponentActivity() {
         val nowMs = SystemClock.elapsedRealtime()
         val today = nowDayKey()
         if (rolloverEnergyDayIfNeeded(today)) {
-            dailyHealthStore.rolloverDayIfNeeded(today)
-            dailyHealth = dailyHealthStore.state
+            rolloverDailyHealthIfNeeded(today)
+            refreshDailyHealth()
             lastBmsEnergyMs = nowMs
             lastBmsEnergyWatts = watts
             persistEnergy()
@@ -1166,6 +1226,13 @@ class MainActivity : ComponentActivity() {
             socPercent in 0..100
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (::bmsBleScanner.isInitialized) {
+            bmsBleScanner.ensureAutoConnect()
+        }
+    }
+
     override fun onPause() {
         persistEnergy()
         super.onPause()
@@ -1175,7 +1242,13 @@ class MainActivity : ComponentActivity() {
         stopUsbAlarm()
         stopLowSocAlarm()
         stopRidenOtpAlarm()
-        bmsBleScanner.stopScan()
+        if (::bmsBleScanner.isInitialized) {
+            if (isFinishing) {
+                bmsBleScanner.shutdown()
+            } else {
+                bmsBleScanner.stopScan()
+            }
+        }
         ridenUsbMonitor.stop()
         persistEnergy()
         applyControllerKeepAlive(false)
@@ -1187,6 +1260,7 @@ class MainActivity : ComponentActivity() {
         private const val ENERGY_PREFS = "energy_counters"
         private const val KEY_BALANCE_V = "balance_v"
         private const val KEY_MAX_BATTERY_V = "max_battery_v"
+        private const val KEY_BMS_OFFLINE_MAX_BATTERY_V = "bms_offline_max_battery_v"
         private const val KEY_BALANCE_EVERY_DAYS = "balance_every_days"
         private const val KEY_LAST_BALANCE_EPOCH_DAY = "last_balance_epoch_day"
         private const val KEY_MAX_CHARGE_A = "max_charge_a"
@@ -1202,6 +1276,9 @@ class MainActivity : ComponentActivity() {
         private const val KEY_MIN_TARGET_PV_V = "min_target_pv_v"
         private const val KEY_MAX_TARGET_PV_V = "max_target_pv_v"
         private const val KEY_KNEE_STEP_V = "knee_step_v"
+        private const val KEY_FAST_PROBE_RECOVERY_KNEE_BACK_V = "fast_probe_recovery_knee_back_v"
+        private const val KEY_PROBE_RECOVERY_KNEE_BACK_V = "probe_recovery_knee_back_v"
+        private const val KEY_PROBE_RECOVERY_ISET_FRACTION = "probe_recovery_iset_fraction"
         private const val KEY_HCC_QUIET_S = "hcc_quiet_s"
         private const val KEY_KNEE_TRACKING_DELAY_S = "knee_tracking_delay_s"
         private const val KEY_KNEE_TRACKING_DELAY_MIN_S = "knee_tracking_delay_min_s"

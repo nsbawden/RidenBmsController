@@ -147,14 +147,17 @@ class RidenUsbMonitor(
                         )
                     )
 
+                    var sampleSeq = 0L
                     while (isActive) {
                         val telemetry = ioMutex.withLock { readTelemetry(io) }
+                        sampleSeq += 1L
                         publishOnMain(
                             state.copy(
                                 connected = true,
                                 permissionNeeded = false,
                                 status = "Riden live",
-                                telemetry = telemetry
+                                telemetry = telemetry,
+                                telemetrySampleSeq = sampleSeq
                             )
                         )
                         delay(POLL_MS)

@@ -8,9 +8,11 @@ import java.util.Locale
 data class OpsLogDaySummary(
     val dateLabel: String,
     val telemetryBytes: Long,
-    val eventsBytes: Long
+    val eventsBytes: Long,
+    val skyBytes: Long = 0L,
+    val crashBytes: Long = 0L
 ) {
-    val totalBytes: Long get() = telemetryBytes + eventsBytes
+    val totalBytes: Long get() = telemetryBytes + eventsBytes + skyBytes + crashBytes
 }
 
 data class OpsLogStorageSummary(
@@ -79,11 +81,13 @@ class OpsLogger(baseDir: File) {
     }
 
     fun refreshSummary(): OpsLogStorageSummary {
+        pruneSupersededTelemetryFiles()
+        purgeLogsOlderThanDays(PHONE_LOG_RETAIN_DAYS)
         val byDay = linkedMapOf<String, OpsLogDaySummary>()
         logDir.listFiles()?.forEach { file ->
             val dateLabel = file.name.substringBefore('_')
             if (!dateLabel.matches(DATE_PATTERN)) return@forEach
-            val current = byDay[dateLabel] ?: OpsLogDaySummary(dateLabel, 0L, 0L)
+            val current = byDay[dateLabel] ?: OpsLogDaySummary(dateLabel, 0L, 0L, 0L, 0L)
             byDay[dateLabel] = when {
                 file.name.endsWith("_telemetry.csv") ||
                     file.name.endsWith("_telemetry_v2.csv") ||
@@ -93,6 +97,10 @@ class OpsLogger(baseDir: File) {
                     current.copy(telemetryBytes = current.telemetryBytes + file.length())
                 file.name.endsWith("_events.csv") ->
                     current.copy(eventsBytes = current.eventsBytes + file.length())
+                file.name.endsWith("_sky_disturbances.csv") ->
+                    current.copy(skyBytes = current.skyBytes + file.length())
+                file.name.endsWith("_crash_episodes.csv") ->
+                    current.copy(crashBytes = current.crashBytes + file.length())
                 else -> current
             }
         }
@@ -102,6 +110,37 @@ class OpsLogger(baseDir: File) {
             days = days,
             logDirectory = logDir.absolutePath
         )
+    }
+
+    /** Drop older telemetry schema files when a newer one exists for the same day. */
+    fun pruneSupersededTelemetryFiles(): Int {
+        val dayLabels = logDir.listFiles()
+            ?.mapNotNull { file ->
+                val dateLabel = file.name.substringBefore('_')
+                dateLabel.takeIf { it.matches(DATE_PATTERN) && file.name.contains("_telemetry") }
+            }
+            ?.distinct()
+            ?: return 0
+
+        var removed = 0
+        for (dayLabel in dayLabels) {
+            val active = activeTelemetryFileForDay(dayLabel) ?: continue
+            logDir.listFiles()?.forEach { file ->
+                if (!file.name.startsWith("${dayLabel}_telemetry")) return@forEach
+                if (file.absolutePath == active.absolutePath) return@forEach
+                if (file.delete()) removed += 1
+            }
+        }
+        return removed
+    }
+
+    /** Remove daily log files on the phone older than [retainDays] (today always kept). */
+    fun purgeLogsOlderThanDays(retainDays: Int): Int {
+        if (retainDays <= 0) return 0
+        val calendar = java.util.Calendar.getInstance()
+        calendar.add(java.util.Calendar.DAY_OF_YEAR, -retainDays)
+        val cutoffLabel = dayFormat.format(calendar.time)
+        return deleteLogsBeforeDate(cutoffLabel)
     }
 
     /** Deletes daily log files strictly before [cutoffDateLabel] (YYYY-MM-DD). Returns files removed. */
@@ -151,6 +190,29 @@ class OpsLogger(baseDir: File) {
 
     private fun dayLabel(timestampMs: Long): String {
         return dayFormat.format(Date(timestampMs))
+    }
+
+    private fun dayStartMs(dayLabel: String): Long {
+        return dayFormat.parse(dayLabel)?.time ?: System.currentTimeMillis()
+    }
+
+    private fun activeTelemetryFileForDay(dayLabel: String): File? {
+        return logDir.listFiles()
+            ?.filter { file ->
+                file.name.startsWith("${dayLabel}_telemetry") && file.length() > 0L
+            }
+            ?.maxByOrNull { telemetrySchemaRank(it.name) }
+    }
+
+    private fun telemetrySchemaRank(fileName: String): Int {
+        return when {
+            fileName.endsWith("_telemetry_v5.csv") -> 5
+            fileName.endsWith("_telemetry_v4.csv") -> 4
+            fileName.endsWith("_telemetry_v3.csv") -> 3
+            fileName.endsWith("_telemetry_v2.csv") -> 2
+            fileName.endsWith("_telemetry.csv") -> 1
+            else -> 0
+        }
     }
 
     private fun ensureHeader(file: File, header: String) {
@@ -205,7 +267,8 @@ class OpsLogger(baseDir: File) {
 
     companion object {
         const val LOG_DIR_NAME = "ops_logs"
-        const val STORAGE_WARN_BYTES = 50L * 1024L * 1024L
+        const val STORAGE_WARN_BYTES = 100L * 1024L * 1024L
+        const val PHONE_LOG_RETAIN_DAYS = 7
         private val DATE_PATTERN = Regex("\\d{4}-\\d{2}-\\d{2}")
 
         const val TELEMETRY_HEADER =

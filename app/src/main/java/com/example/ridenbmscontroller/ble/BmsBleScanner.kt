@@ -197,8 +197,47 @@ class BmsBleScanner(
 
     fun refresh() {
         publish(status)
-        if (hasPermissions() && autoConnectAddress != null && connectedDeviceAddress == null && !connecting && !scanning) {
-            beginAutoConnectRetries()
+        ensureAutoConnect()
+    }
+
+    /** Drop any active GATT session without clearing the remembered BMS address. */
+    fun shutdown() {
+        handler.removeCallbacks(autoConnectRetryRunnable)
+        handler.removeCallbacks(connectTimeoutRunnable)
+        handler.removeCallbacks(scanTimeoutRunnable)
+        stopScan("App stopping")
+        stopPolling()
+        if (gatt != null || connecting || connectedDeviceAddress != null) {
+            disconnectGatt()
+            closeGatt()
+        }
+        connecting = false
+        connectedDeviceName = null
+        connectedDeviceAddress = null
+        gattServices = emptyList()
+        notifyCharacteristic = null
+        writeCharacteristic = null
+        publish("Ready")
+    }
+
+    /** Reset retry budget and reconnect to the remembered BMS when needed. */
+    fun ensureAutoConnect() {
+        publish(status)
+        if (userDisconnectRequested || autoConnectAddress == null) return
+        if (connectedDeviceAddress != null || connecting || scanning) return
+        handler.removeCallbacks(autoConnectRetryRunnable)
+        autoConnectRetriesRemaining = AUTO_CONNECT_RETRIES
+        reclaimStaleConnection {
+            handler.postDelayed({
+                if (!userDisconnectRequested &&
+                    autoConnectAddress != null &&
+                    connectedDeviceAddress == null &&
+                    !connecting &&
+                    !scanning
+                ) {
+                    beginAutoConnectRetries()
+                }
+            }, STALE_RECLAIM_SETTLE_MS)
         }
     }
 
@@ -471,6 +510,56 @@ class BmsBleScanner(
         handler.postDelayed(autoConnectRetryRunnable, AUTO_CONNECT_RETRY_DELAY_MS)
     }
 
+    @SuppressLint("MissingPermission")
+    private fun reclaimStaleConnection(onComplete: () -> Unit) {
+        val address = autoConnectAddress
+        if (address == null || !hasPermissions()) {
+            onComplete()
+            return
+        }
+        val adapter = bluetoothManager?.adapter
+        if (adapter == null || !adapter.isEnabled) {
+            onComplete()
+            return
+        }
+
+        var finished = false
+        fun finish() {
+            if (finished) return
+            finished = true
+            handler.removeCallbacks(reclaimTimeoutRunnable)
+            onComplete()
+        }
+
+        reclaimTimeoutRunnable = Runnable { finish() }
+        handler.postDelayed(reclaimTimeoutRunnable, STALE_RECLAIM_TIMEOUT_MS)
+
+        runCatching {
+            adapter.getRemoteDevice(address).connectGatt(
+                appContext,
+                false,
+                object : BluetoothGattCallback() {
+                    override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                        handler.post {
+                            when (newState) {
+                                BluetoothProfile.STATE_CONNECTED -> gatt.disconnect()
+                                BluetoothProfile.STATE_DISCONNECTED -> {
+                                    gatt.close()
+                                    finish()
+                                }
+                            }
+                        }
+                    }
+                },
+                BluetoothDevice.TRANSPORT_LE
+            )
+        }.onFailure {
+            finish()
+        }
+    }
+
+    private var reclaimTimeoutRunnable: Runnable = Runnable {}
+
     private fun startPolling() {
         stopPolling()
         handler.postDelayed(pollRunnable, 500L)
@@ -681,6 +770,8 @@ class BmsBleScanner(
         private const val SCAN_WINDOW_MS = 20_000L
         private const val AUTO_CONNECT_RETRIES = 3
         private const val AUTO_CONNECT_RETRY_DELAY_MS = 2_500L
+        private const val STALE_RECLAIM_TIMEOUT_MS = 3_000L
+        private const val STALE_RECLAIM_SETTLE_MS = 500L
         private const val CONNECT_TIMEOUT_MS = 12_000L
         private const val POLL_INTERVAL_MS = 1_500L
         private const val MAX_RAW_PACKETS = 40

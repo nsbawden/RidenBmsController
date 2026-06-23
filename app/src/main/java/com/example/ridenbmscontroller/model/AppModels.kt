@@ -82,6 +82,7 @@ data class AlertState(
 
 data class AppSettings(
     val maxBatteryVolts: Double,
+    val bmsOfflineMaxBatteryVolts: Double,
     val balanceEveryDays: Int,
     val lastBalanceEpochDay: Long,
     val maxChargeAmps: Double,
@@ -94,6 +95,8 @@ data class AppSettings(
     val minTargetPvVolts: Double,
     val maxTargetPvVolts: Double,
     val kneeStepVolts: Double,
+    val fastProbeRecoveryKneeBackVolts: Double,
+    val probeRecoveryIsetFraction: Double,
     val kneeTrackingDelayMinSeconds: Double,
     val kneeTrackingDelayMaxSeconds: Double,
     val fastAcquireSuccessCount: Int,
@@ -190,6 +193,7 @@ data class AppState(
             ),
             settings = AppSettings(
                 maxBatteryVolts = 14.20,
+                bmsOfflineMaxBatteryVolts = 14.20,
                 balanceEveryDays = 7,
                 lastBalanceEpochDay = 0L,
                 maxChargeAmps = 24.0,
@@ -202,6 +206,8 @@ data class AppState(
                 minTargetPvVolts = 30.0,
                 maxTargetPvVolts = 36.0,
                 kneeStepVolts = 0.10,
+                fastProbeRecoveryKneeBackVolts = 0.50,
+                probeRecoveryIsetFraction = 0.80,
                 kneeTrackingDelayMinSeconds = 30.0,
                 kneeTrackingDelayMaxSeconds = 300.0,
                 fastAcquireSuccessCount = 2,

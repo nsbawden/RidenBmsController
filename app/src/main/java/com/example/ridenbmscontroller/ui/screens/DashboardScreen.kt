@@ -542,10 +542,10 @@ private fun HealthPanel(state: AppState) {
                     Modifier.weight(1f)
                 )
                 ValueTile(
-                    "Min Out A",
-                    formatHealthAmps(state.dailyHealth.minRidenOutputAmpsToday),
-                    "A",
-                    CurrentRose,
+                    "Clean Max",
+                    formatHealthGap(state.dailyHealth.longestCleanGapMs),
+                    "between crashes",
+                    if ((state.dailyHealth.longestCleanGapMs ?: 0L) >= 3_600_000L) PowerBlue else TextMuted,
                     Modifier.weight(1f)
                 )
                 ValueTile(
@@ -562,6 +562,15 @@ private fun HealthPanel(state: AppState) {
 
 private fun formatHealthAmps(amps: Double?): String {
     return amps?.let { "%.2f".format(it) } ?: "—"
+}
+
+private fun formatHealthGap(gapMs: Long?): String {
+    if (gapMs == null || gapMs <= 0L) return "—"
+    val totalMinutes = gapMs / 60_000L
+    if (totalMinutes < 60L) return "${totalMinutes}m"
+    val hours = totalMinutes / 60L
+    val minutes = totalMinutes % 60L
+    return if (minutes == 0L) "${hours}h" else "${hours}h ${minutes}m"
 }
 
 @Composable

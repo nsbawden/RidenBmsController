@@ -19,5 +19,7 @@ data class RidenUsbState(
     val deviceName: String? = null,
     val vendorId: Int? = null,
     val productId: Int? = null,
-    val telemetry: RidenTelemetry = RidenTelemetry()
+    val telemetry: RidenTelemetry = RidenTelemetry(),
+    /** Incremented on each successful Modbus telemetry read (fresh Riden sample). */
+    val telemetrySampleSeq: Long = 0L
 )

@@ -1,6 +1,8 @@
 package com.example.ridenbmscontroller.controller
 
 import com.example.ridenbmscontroller.ble.BmsBleUiState
+import com.example.ridenbmscontroller.health.CrashLogSample
+import com.example.ridenbmscontroller.health.SkyDisturbanceSnapshot
 import com.example.ridenbmscontroller.model.AppSettings
 import com.example.ridenbmscontroller.riden.RidenTelemetry
 import com.example.ridenbmscontroller.riden.RidenUsbState
@@ -54,7 +56,9 @@ class SolarMpptController(
     private val onBalanceDayStarted: (Long) -> Unit,
     private val onState: (MpptControlState) -> Unit,
     private val onEvent: (String) -> Unit = {},
-    private val onCollapseEntered: (scheduled: Boolean) -> Unit = {}
+    private val onCollapseEntered: (scheduled: Boolean, preCrash: SkyDisturbanceSnapshot?) -> Unit = { _, _ -> },
+    private val onCrashEpisodeStart: (kind: String, preCrash: SkyDisturbanceSnapshot?, nowMs: Long) -> Int = { _, _, _ -> 0 },
+    private val onCrashLogSample: (CrashLogSample) -> Unit = {}
 ) {
     private var outputEnabled = false
     private var commandIset = 0.0
@@ -124,6 +128,20 @@ class SolarMpptController(
     private var sunProbeLastGoodIset = Tuning.MIN_ISET
     private var sunProbeSettleSinceMs = 0L
     private var overnightVinNearVout = false
+    private var bmsOfflineActive = false
+    private var lastPreCollapseSnapshot: SkyDisturbanceSnapshot? = null
+    private var crashLogActive = false
+    private var crashLogEpisodeId = 0
+    private var crashLogEpisodeKind = ""
+    private var crashLogRowKind = ""
+    private var crashLogEpisodeStartMs = 0L
+    private var crashLogPhase = CRASH_LOG_IDLE
+    private var crashLogStableTicks = 0
+    private var crashLogTailTicks = 0
+    private var crashLogEpisodeStartPending = false
+    private var crashLogPreCrash: SkyDisturbanceSnapshot? = null
+    private var crashLogKneeProbeFastAtEntry = false
+    private var lastCrashLoggedRidenSeq = 0L
 
     fun resetLearnedKnee() {
         kneeOffsetVolts = 0.0
@@ -180,19 +198,37 @@ class SolarMpptController(
         }
     }
 
+    private fun maybeEmitCrashLog(
+        settings: AppSettings,
+        bmsState: BmsBleUiState,
+        ridenState: RidenUsbState,
+        now: Long
+    ) {
+        if (!crashLogActive || !settings.controllerEnabled || !ridenState.connected) return
+        val sampleSeq = ridenState.telemetrySampleSeq
+        if (sampleSeq == lastCrashLoggedRidenSeq) return
+        lastCrashLoggedRidenSeq = sampleSeq
+        emitCrashLogFromCurrentState(settings, bmsState, ridenState, now)
+    }
+
     fun tick(
         settings: AppSettings,
         bmsState: BmsBleUiState,
         ridenState: RidenUsbState
     ) {
         val now = System.currentTimeMillis()
-        if (now - lastTickMs < settings.controllerLoopMs.toLong()) return
+        val loopMs = settings.controllerLoopMs.toLong()
+        if (now - lastTickMs < loopMs) {
+            maybeEmitCrashLog(settings, bmsState, ridenState, now)
+            return
+        }
         lastTickMs = now
 
         val riden = ridenState.telemetry
         val bms = bmsState.telemetry
 
         if (!settings.controllerEnabled || !ridenState.connected) {
+            bmsOfflineActive = false
             idle(settings, ridenState.telemetry, "Controller off")
             return
         }
@@ -200,39 +236,47 @@ class SolarMpptController(
         val batteryVolts = bms.packVoltage
         val batteryAmps = bms.packCurrent
         val socPercent = bms.socPercent
-        if (bmsState.connectedDeviceAddress == null || batteryVolts == null || batteryAmps == null || socPercent == null) {
-            idle(settings, ridenState.telemetry, "BMS required: controller idle")
-            return
+        val bmsReady = bmsState.connectedDeviceAddress != null &&
+            batteryVolts != null && batteryAmps != null && socPercent != null
+
+        updateBmsOfflineTransition(bmsReady, settings)
+
+        val chargeVoltageLimit = if (bmsReady) {
+            settings.maxBatteryVolts
+        } else {
+            settings.bmsOfflineMaxBatteryVolts
         }
 
-        val balanceDay = isBalanceDay(settings)
+        val balanceDay = bmsReady && isBalanceDay(settings)
         if (balanceDay && settings.lastBalanceEpochDay != currentEpochDay()) {
             onBalanceDayStarted(currentEpochDay())
         }
         val socTarget = if (balanceDay) 100 else settings.normalSocCeilingPercent
 
-        val chargeBlockingAlarms = bms.chargeBlockingAlarmNames
-        if (chargeBlockingAlarms.isNotEmpty()) {
-            updateAlarmBackoff(now)
-            inhibitCharging(
-                settings = settings,
-                riden = ridenState.telemetry,
-                status = "BMS alarm: ${chargeBlockingAlarms.joinToString()}",
-                socTargetPercent = socTarget
-            )
-            return
-        }
-        if (alarmWasActive) {
-            alarmWasActive = false
-            alarmHoldUntilMs = now + alarmBackoffMs
-        }
-        if (now < alarmHoldUntilMs) {
-            val seconds = ((alarmHoldUntilMs - now) / 1000L).coerceAtLeast(1L)
-            inhibitCharging(settings, ridenState.telemetry, "BMS alarm cleared: retry in ${seconds}s", socTarget)
-            return
-        }
-        if (lastAlarmStartMs > 0L && now - lastAlarmStartMs >= Tuning.ALARM_STABLE_RESET_MS) {
-            alarmBackoffMs = Tuning.ALARM_BASE_HOLD_MS
+        if (bmsReady) {
+            val chargeBlockingAlarms = bms.chargeBlockingAlarmNames
+            if (chargeBlockingAlarms.isNotEmpty()) {
+                updateAlarmBackoff(now)
+                inhibitCharging(
+                    settings = settings,
+                    riden = ridenState.telemetry,
+                    status = "BMS alarm: ${chargeBlockingAlarms.joinToString()}",
+                    socTargetPercent = socTarget
+                )
+                return
+            }
+            if (alarmWasActive) {
+                alarmWasActive = false
+                alarmHoldUntilMs = now + alarmBackoffMs
+            }
+            if (now < alarmHoldUntilMs) {
+                val seconds = ((alarmHoldUntilMs - now) / 1000L).coerceAtLeast(1L)
+                inhibitCharging(settings, ridenState.telemetry, "BMS alarm cleared: retry in ${seconds}s", socTarget)
+                return
+            }
+            if (lastAlarmStartMs > 0L && now - lastAlarmStartMs >= Tuning.ALARM_STABLE_RESET_MS) {
+                alarmBackoffMs = Tuning.ALARM_BASE_HOLD_MS
+            }
         }
 
         val vin = riden.vin ?: 0.0
@@ -241,15 +285,26 @@ class SolarMpptController(
         val snapIset = riden.iset
         val snapWatts = riden.watts ?: 0.0
         val virtualKnee = virtualKnee(settings)
-        val voltageLimited = vout >= settings.maxBatteryVolts - Tuning.VOLTAGE_LIMIT_EPS
+        val voltageLimited = vout >= chargeVoltageLimit - Tuning.VOLTAGE_LIMIT_EPS
         val currentLimit = settings.maxChargeAmps.coerceAtLeast(Tuning.MIN_ISET)
-        val targetBatteryCurrent = if (socPercent >= socTarget || voltageLimited) {
-            settings.socHoldCurrentAmps
-        } else {
-            currentLimit
+        val targetBatteryCurrent = when {
+            !bmsReady && voltageLimited -> settings.socHoldCurrentAmps
+            !bmsReady -> currentLimit
+            socPercent >= socTarget || voltageLimited -> settings.socHoldCurrentAmps
+            else -> currentLimit
         }
 
-        ensureOutputAndVoltage(settings)
+        ensureOutputAndVoltage(settings, chargeVoltageLimit)
+
+        if (recoveryPhase == PHASE_NONE && !isCollapsed(settings, vin)) {
+            lastPreCollapseSnapshot = SkyDisturbanceSnapshot(
+                timestampMs = now,
+                ioutA = riden.iout,
+                voutV = riden.vout,
+                vinV = vin,
+                vtranV = virtualKnee
+            )
+        }
 
         val policyLimit = targetBatteryCurrent.coerceAtMost(currentLimit)
         if (needsRidenTakeover) {
@@ -280,10 +335,17 @@ class SolarMpptController(
                 val iset = handleSolarTick(
                     settings, oldIset, vin, vout, riden.watts ?: 0.0, virtualKnee, policyLimit, now
                 )
-                if (socPercent >= socTarget || voltageLimited) {
-                    pvMode = if (balanceDay) MODE_BALANCE else if (socPercent >= socTarget) MODE_SOC_HOLD else MODE_VOLTAGE_LIMIT
-                    resetCollapseState()
-                    updateStableRecoveryReset(false, settings, vin, virtualKnee, now)
+                when {
+                    !bmsReady && voltageLimited -> {
+                        pvMode = MODE_VOLTAGE_LIMIT
+                        resetCollapseState()
+                        updateStableRecoveryReset(false, settings, vin, virtualKnee, now)
+                    }
+                    bmsReady && (socPercent >= socTarget || voltageLimited) -> {
+                        pvMode = if (balanceDay) MODE_BALANCE else if (socPercent >= socTarget) MODE_SOC_HOLD else MODE_VOLTAGE_LIMIT
+                        resetCollapseState()
+                        updateStableRecoveryReset(false, settings, vin, virtualKnee, now)
+                    }
                 }
                 iset
             }
@@ -303,12 +365,60 @@ class SolarMpptController(
         )
         publish(
             settings = settings,
-            status = statusFor(balanceDay, socPercent >= socTarget, voltageLimited),
+            status = if (bmsReady) {
+                statusFor(balanceDay, socPercent >= socTarget, voltageLimited)
+            } else {
+                statusForBmsOffline(voltageLimited, chargeVoltageLimit)
+            },
             policyLimit = targetBatteryCurrent,
             band = if (lastAppliedControlBand != "--") lastAppliedControlBand else bandFor(finalVinError),
             stepAmps = if (lastAppliedHuntStepA > 0.0) lastAppliedHuntStepA else stepFor(finalVinError, policyLimit),
             vinError = finalVinError,
-            socTargetPercent = socTarget
+            socTargetPercent = if (bmsReady) socTarget else settings.normalSocCeilingPercent
+        )
+        maybeEmitCrashLog(settings, bmsState, ridenState, now)
+    }
+
+    private fun emitCrashLogFromCurrentState(
+        settings: AppSettings,
+        bmsState: BmsBleUiState,
+        ridenState: RidenUsbState,
+        now: Long
+    ) {
+        val riden = ridenState.telemetry
+        val bms = bmsState.telemetry
+        val batteryVolts = bms.packVoltage
+        val batteryAmps = bms.packCurrent
+        val socPercent = bms.socPercent
+        val bmsReady = bmsState.connectedDeviceAddress != null &&
+            batteryVolts != null && batteryAmps != null && socPercent != null
+        val chargeVoltageLimit = if (bmsReady) {
+            settings.maxBatteryVolts
+        } else {
+            settings.bmsOfflineMaxBatteryVolts
+        }
+        val balanceDay = bmsReady && isBalanceDay(settings)
+        val socTarget = if (balanceDay) 100 else settings.normalSocCeilingPercent
+        val vin = riden.vin ?: 0.0
+        val vout = riden.vout ?: 0.0
+        val virtualKnee = virtualKnee(settings)
+        val voltageLimited = vout >= chargeVoltageLimit - Tuning.VOLTAGE_LIMIT_EPS
+        val currentLimit = settings.maxChargeAmps.coerceAtLeast(Tuning.MIN_ISET)
+        val targetBatteryCurrent = when {
+            !bmsReady && voltageLimited -> settings.socHoldCurrentAmps
+            !bmsReady -> currentLimit
+            socPercent != null && (socPercent >= socTarget || voltageLimited) -> settings.socHoldCurrentAmps
+            else -> currentLimit
+        }
+        val policyLimit = targetBatteryCurrent.coerceAtMost(currentLimit)
+        val vinError = vin - virtualKnee
+        emitCrashLogTickIfActive(
+            settings = settings,
+            riden = riden,
+            virtualKnee = virtualKnee,
+            policyLimit = policyLimit,
+            vinError = vinError,
+            now = now
         )
     }
 
@@ -329,6 +439,7 @@ class SolarMpptController(
         resetProbePacingState(clearPowerBaseline = false)
         vtuneDescentBlocked = false
 
+        val fastProbeCrash = kneeProbeFast && immediateProbeCrash
         if (kneeProbeFast && immediateProbeCrash) {
             kneeProbeFast = false
         }
@@ -341,7 +452,13 @@ class SolarMpptController(
 
         val preCrashIset = max(max(oldIset, commandIset), lastWorkingIset).coerceAtLeast(Tuning.MIN_ISET)
         lastWorkingIset = preCrashIset
-        setSunReferenceFromCrash(preCrashIset, policyLimit, "pre-crash recall")
+        val probeIrefFraction = settings.probeRecoveryIsetFraction
+        setSunReferenceFromCrash(
+            preCrashIset,
+            policyLimit,
+            "pre-crash recall",
+            if (immediateProbeCrash) probeIrefFraction else Tuning.CRASH_IREF_FRACTION
+        )
         recoveryPhase = PHASE_WAIT_VIN
         pvMode = MODE_RECOVER
         probeRecallPending = false
@@ -354,13 +471,19 @@ class SolarMpptController(
             probeRecoveryActive = true
             probeCrashIset = oldIset.coerceAtLeast(Tuning.MIN_ISET)
             val crashKnee = virtualKnee(settings)
+            val kneeBackV = if (fastProbeCrash) {
+                settings.fastProbeRecoveryKneeBackVolts
+            } else {
+                Tuning.PROBE_RECOVERY_KNEE_BACK_V
+            }
             kneeOffsetVolts = clampKnee(
                 settings,
-                crashKnee + Tuning.PROBE_RECOVERY_KNEE_BACK_V
+                crashKnee + kneeBackV
             ) - settings.targetPvVolts
             lastKneeProbeMs = now
+            val recoveryLabel = if (fastProbeCrash) "Fast probe recovery" else "Probe recovery"
             onEvent(
-                "Probe recovery: knee +${"%.2f".format(Tuning.PROBE_RECOVERY_KNEE_BACK_V)}V -> " +
+                "$recoveryLabel: knee +${"%.2f".format(kneeBackV)}V -> " +
                     "${"%.2f".format(virtualKnee(settings))}V, recall ISET ${"%.2f".format(probeCrashIset)}A"
             )
         } else {
@@ -370,8 +493,11 @@ class SolarMpptController(
         }
 
         if (!scheduled) {
-            onCollapseEntered(false)
+            onCollapseEntered(false, lastPreCollapseSnapshot)
         }
+
+        val crashKind = classifyCrashKind(immediateProbeCrash, fastProbeCrash)
+        noteCrashEpisodeEntered(crashKind, fastProbeCrash, now)
 
         lastAppliedHuntStepA = 0.0
         lastAppliedControlBand = "RE"
@@ -420,12 +546,21 @@ class SolarMpptController(
         if (probeRecoveryActive) {
             probeRecoveryActive = false
             recoveryPhase = PHASE_NONE
-            val recall = quantAmps(probeCrashIset * Tuning.PROBE_RECOVERY_ISET_FRACTION)
+            val recallFraction = settings.probeRecoveryIsetFraction
+            val recall = quantAmps(probeCrashIset * recallFraction)
                 .coerceIn(Tuning.MIN_ISET, policyLimit)
             commandIset = recall
-            setSunReferenceFromCrash(probeCrashIset, policyLimit, "probe crash recall")
+            setSunReferenceFromCrash(
+                probeCrashIset,
+                policyLimit,
+                "probe crash recall",
+                recallFraction
+            )
             pvMode = MODE_TRACKING
-            onEvent("Probe recall ISET ${"%.2f".format(recall)}A (90% of ${"%.2f".format(probeCrashIset)}A)")
+            val recallPct = (recallFraction * 100.0).toInt()
+            onEvent(
+                "Probe recall ISET ${"%.2f".format(recall)}A ($recallPct% of ${"%.2f".format(probeCrashIset)}A)"
+            )
             updateStableRecoveryReset(true, settings, vin, virtualKnee, now)
             return trackSolarKnee(settings, recall, vin, vout, outputWatts, virtualKnee, policyLimit, now)
         }
@@ -665,9 +800,14 @@ class SolarMpptController(
         sunProbeSettleSinceMs = 0L
     }
 
-    private fun setSunReferenceFromCrash(preCrashIset: Double, policyLimit: Double, label: String) {
+    private fun setSunReferenceFromCrash(
+        preCrashIset: Double,
+        policyLimit: Double,
+        label: String,
+        irefFraction: Double
+    ) {
         sunReferenceIset = quantAmps(
-            (preCrashIset * Tuning.CRASH_IREF_FRACTION).coerceIn(Tuning.MIN_ISET, policyLimit)
+            (preCrashIset * irefFraction).coerceIn(Tuning.MIN_ISET, policyLimit)
         )
         sunReferenceKnown = true
         morningMinimalSun = false
@@ -1115,7 +1255,8 @@ class SolarMpptController(
     }
 
     private fun isetStepFromPct(iset: Double, pct: Double): Double {
-        return iset.coerceAtLeast(0.0) * pct / 100.0
+        val raw = iset.coerceAtLeast(0.0) * pct / 100.0
+        return raw.coerceAtLeast(Tuning.FINE_STEP_A)
     }
 
     private fun raiseKneeForCollapse(settings: AppSettings) {
@@ -1144,6 +1285,170 @@ class SolarMpptController(
 
     private fun repeatedCollapseWindowMs(settings: AppSettings): Long {
         return (effectiveKneeDelaySeconds(settings) * 750.0).toLong().coerceIn(2_000L, 10_000L)
+    }
+
+    private fun classifyCrashKind(immediateProbeCrash: Boolean, fastProbeCrash: Boolean): String {
+        if (!immediateProbeCrash) return CRASH_KIND_CLOUD
+        return if (fastProbeCrash) CRASH_KIND_FAST_PROBE else CRASH_KIND_MAINTENANCE_PROBE
+    }
+
+    private fun noteCrashEpisodeEntered(kind: String, kneeProbeFastAtCrash: Boolean, now: Long) {
+        if (crashLogActive) {
+            crashLogRowKind = CRASH_KIND_RECOLLAPSE
+            crashLogPhase = CRASH_LOG_RECOVERING
+            crashLogStableTicks = 0
+            crashLogTailTicks = 0
+            return
+        }
+        crashLogEpisodeKind = kind
+        crashLogRowKind = kind
+        crashLogEpisodeStartMs = now
+        crashLogPreCrash = lastPreCollapseSnapshot
+        crashLogKneeProbeFastAtEntry = kneeProbeFastAtCrash
+        crashLogEpisodeId = onCrashEpisodeStart(kind, lastPreCollapseSnapshot, now)
+        crashLogActive = true
+        crashLogPhase = CRASH_LOG_RECOVERING
+        crashLogStableTicks = 0
+        crashLogTailTicks = 0
+        crashLogEpisodeStartPending = true
+        lastCrashLoggedRidenSeq = -1L
+    }
+
+    private fun emitCrashLogTickIfActive(
+        settings: AppSettings,
+        riden: RidenTelemetry,
+        virtualKnee: Double,
+        policyLimit: Double,
+        vinError: Double,
+        now: Long
+    ) {
+        if (!crashLogActive) return
+
+        val vin = riden.vin ?: 0.0
+        val episodeStart = crashLogEpisodeStartPending
+        crashLogEpisodeStartPending = false
+        val preCrash = if (episodeStart) crashLogPreCrash else null
+
+        if (preCrash != null && preCrash.vinV != null) {
+            val preVtran = preCrash.vtranV ?: virtualKnee
+            val preVin = preCrash.vinV ?: vin
+            onCrashLogSample(
+                CrashLogSample(
+                    timestampMs = preCrash.timestampMs,
+                    episodeId = crashLogEpisodeId,
+                    msSinceEpisode = preCrash.timestampMs - crashLogEpisodeStartMs,
+                    crashKind = crashLogRowKind,
+                    episodeKind = crashLogEpisodeKind,
+                    episodeStart = true,
+                    preIoutA = preCrash.ioutA,
+                    preVoutV = preCrash.voutV,
+                    preVinV = preCrash.vinV,
+                    preVtranV = preCrash.vtranV,
+                    ioutA = preCrash.ioutA,
+                    voutV = preCrash.voutV,
+                    vinV = preVin,
+                    vtranV = preVtran,
+                    vinErrorV = preVin - preVtran,
+                    commandIsetA = commandIset,
+                    ridenIsetA = riden.iset,
+                    pvMode = pvMode,
+                    recoveryPhase = recoveryPhase,
+                    poutW = riden.watts ?: 0.0,
+                    pinEstW = lastEstimatedPinW,
+                    kneeOffsetV = kneeOffsetVolts,
+                    recoveryCycleCount = recoveryCycleCount,
+                    controlBand = lastAppliedControlBand,
+                    controlStepA = lastAppliedHuntStepA,
+                    policyLimitA = policyLimit,
+                    probeCrashIsetA = probeCrashIset,
+                    probeRecoveryActive = probeRecoveryActive,
+                    kneeProbeFast = crashLogKneeProbeFastAtEntry
+                )
+            )
+        }
+
+        onCrashLogSample(
+            CrashLogSample(
+                timestampMs = now,
+                episodeId = crashLogEpisodeId,
+                msSinceEpisode = (now - crashLogEpisodeStartMs).coerceAtLeast(0L),
+                crashKind = crashLogRowKind,
+                episodeKind = crashLogEpisodeKind,
+                episodeStart = preCrash == null && episodeStart,
+                preIoutA = preCrash?.ioutA,
+                preVoutV = preCrash?.voutV,
+                preVinV = preCrash?.vinV,
+                preVtranV = preCrash?.vtranV,
+                ioutA = riden.iout,
+                voutV = riden.vout,
+                vinV = vin,
+                vtranV = virtualKnee,
+                vinErrorV = vinError,
+                commandIsetA = commandIset,
+                ridenIsetA = riden.iset,
+                pvMode = pvMode,
+                recoveryPhase = recoveryPhase,
+                poutW = riden.watts ?: 0.0,
+                pinEstW = lastEstimatedPinW,
+                kneeOffsetV = kneeOffsetVolts,
+                recoveryCycleCount = recoveryCycleCount,
+                controlBand = lastAppliedControlBand,
+                controlStepA = lastAppliedHuntStepA,
+                policyLimitA = policyLimit,
+                probeCrashIsetA = probeCrashIset,
+                probeRecoveryActive = probeRecoveryActive,
+                kneeProbeFast = crashLogKneeProbeFastAtEntry
+            )
+        )
+        crashLogRowKind = crashLogEpisodeKind
+
+        val tracking = pvMode == MODE_TRACKING && recoveryPhase == PHASE_NONE
+        val stable = tracking &&
+            vin >= recoveryExitFloor(settings) &&
+            abs(vin - virtualKnee) <= Tuning.RECOVERY_STABLE_ERR_V
+
+        when (crashLogPhase) {
+            CRASH_LOG_RECOVERING -> {
+                if (stable) {
+                    crashLogPhase = CRASH_LOG_STABLE_COUNT
+                    crashLogStableTicks = 1
+                }
+            }
+            CRASH_LOG_STABLE_COUNT -> {
+                if (!stable) {
+                    crashLogPhase = CRASH_LOG_RECOVERING
+                    crashLogStableTicks = 0
+                } else {
+                    crashLogStableTicks += 1
+                    if (crashLogStableTicks >= Tuning.CRASH_LOG_STABLE_CYCLES) {
+                        crashLogPhase = CRASH_LOG_TAIL
+                        crashLogTailTicks = 0
+                    }
+                }
+            }
+            CRASH_LOG_TAIL -> {
+                if (!stable) {
+                    crashLogPhase = CRASH_LOG_RECOVERING
+                    crashLogStableTicks = 0
+                    crashLogTailTicks = 0
+                } else {
+                    crashLogTailTicks += 1
+                    if (crashLogTailTicks >= Tuning.CRASH_LOG_TAIL_CYCLES) {
+                        endCrashLogging()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun endCrashLogging() {
+        crashLogActive = false
+        crashLogPhase = CRASH_LOG_IDLE
+        crashLogStableTicks = 0
+        crashLogTailTicks = 0
+        crashLogEpisodeStartPending = false
+        crashLogPreCrash = null
+        lastCrashLoggedRidenSeq = 0L
     }
 
     private fun updateStableRecoveryReset(
@@ -1189,14 +1494,34 @@ class SolarMpptController(
         }
     }
 
-    private fun ensureOutputAndVoltage(settings: AppSettings) {
+    private fun statusForBmsOffline(voltageLimited: Boolean, chargeVoltageLimit: Double): String {
+        val limitLabel = "%.2f".format(chargeVoltageLimit)
+        return when {
+            pvMode == MODE_RECOVER -> "Solar recovery (BMS offline): $recoveryPhase"
+            pvMode == MODE_SUN_PROBE -> "Sun probe (BMS offline)"
+            voltageLimited -> "BMS offline: at ${limitLabel}V limit"
+            else -> "BMS offline: tracking to ${limitLabel}V max"
+        }
+    }
+
+    private fun updateBmsOfflineTransition(bmsReady: Boolean, settings: AppSettings) {
+        if (!bmsReady && !bmsOfflineActive) {
+            bmsOfflineActive = true
+            onEvent("BMS offline: voltage fallback ${"%.2f".format(settings.bmsOfflineMaxBatteryVolts)}V")
+        } else if (bmsReady && bmsOfflineActive) {
+            bmsOfflineActive = false
+            onEvent("BMS online: resuming SOC regulation")
+        }
+    }
+
+    private fun ensureOutputAndVoltage(settings: AppSettings, chargeVoltageLimit: Double) {
         if (!outputEnabled) {
             setOutput(true)
             outputEnabled = true
         }
-        if (abs(lastVset - settings.maxBatteryVolts) >= Tuning.VSET_UPDATE_EPS) {
-            setVset(settings.maxBatteryVolts)
-            lastVset = settings.maxBatteryVolts
+        if (abs(lastVset - chargeVoltageLimit) >= Tuning.VSET_UPDATE_EPS) {
+            setVset(chargeVoltageLimit)
+            lastVset = chargeVoltageLimit
         }
     }
 
@@ -1205,6 +1530,7 @@ class SolarMpptController(
     }
 
     private fun idle(settings: AppSettings, riden: RidenTelemetry, status: String) {
+        bmsOfflineActive = false
         val policyLimit = settings.maxChargeAmps.coerceAtLeast(Tuning.MIN_ISET)
         cacheHandoffIfValid(settings, riden.vin, riden.iset, riden.watts, policyLimit)
         if (outputEnabled) {
@@ -1224,6 +1550,7 @@ class SolarMpptController(
         needsRidenTakeover = true
         takeoverAttemptUntilMs = 0L
         pvMode = MODE_IDLE
+        endCrashLogging()
         publish(settings, status, 0.0, "--")
     }
 
@@ -1239,6 +1566,7 @@ class SolarMpptController(
         needsRidenTakeover = true
         takeoverAttemptUntilMs = 0L
         pvMode = MODE_ALARM
+        endCrashLogging()
         publish(settings, status, 0.0, "--", socTargetPercent = socTargetPercent)
     }
 
@@ -1362,6 +1690,16 @@ class SolarMpptController(
 
         private const val PHASE_NONE = "--"
         private const val PHASE_WAIT_VIN = "Waiting VIN"
+
+        private const val CRASH_LOG_IDLE = 0
+        private const val CRASH_LOG_RECOVERING = 1
+        private const val CRASH_LOG_STABLE_COUNT = 2
+        private const val CRASH_LOG_TAIL = 3
+
+        private const val CRASH_KIND_CLOUD = "cloud"
+        private const val CRASH_KIND_FAST_PROBE = "fast_probe"
+        private const val CRASH_KIND_MAINTENANCE_PROBE = "maintenance_probe"
+        private const val CRASH_KIND_RECOLLAPSE = "recollapse"
     }
 
     private enum class Direction {
@@ -1380,7 +1718,8 @@ class SolarMpptController(
 /**
  * Controller tuning not exposed in Settings.
  *
- * Fast loop (200 ms): single Vin-knee ISET hunt via percent table; FI band fixed 0.01 A.
+ * Fast loop (200 ms): single Vin-knee ISET hunt via percent table; FI band fixed 0.01 A;
+ * percent-band steps floored at 0.01 A (Riden command resolution).
  * Slow loop: periodic VTune down-probe; collapse raises knee.
  */
 private object Tuning {
@@ -1440,7 +1779,6 @@ private object Tuning {
     const val ALARM_STABLE_RESET_MS = 30 * 60_000L
 
     const val PROBE_RECOVERY_KNEE_BACK_V = 0.20
-    const val PROBE_RECOVERY_ISET_FRACTION = 0.90
 
     const val ACQUISITION_PAUSE_MS = 500L
     const val HUNT_LOCK_TICKS = 3
@@ -1448,6 +1786,8 @@ private object Tuning {
     const val MIN_FAST_PROBE_SPACING_MS = 200L
     const val ACQUISITION_MAX_PROBE_CYCLE_MS = 8_000L
     const val EXPECTED_PROBE_COLLAPSE_EXTRA_MS = 12_000L
+    const val CRASH_LOG_STABLE_CYCLES = 5
+    const val CRASH_LOG_TAIL_CYCLES = 5
     const val MAINTENANCE_DOWNSHIFT_STABLE_MS = 5_000L
     const val POWER_PROBE_MIN_EPS_W = 6.0
     const val POWER_PROBE_EPS_FRACTION = 0.05

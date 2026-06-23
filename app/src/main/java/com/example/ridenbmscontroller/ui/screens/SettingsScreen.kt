@@ -72,6 +72,9 @@ fun SettingsScreen(
             NumberFieldRow("Maximum controller voltage", settings.maxBatteryVolts, "V", 12.0, 15.0) {
                 onSettingsChanged(settings.copy(maxBatteryVolts = it))
             }
+            NumberFieldRow("BMS offline max voltage", settings.bmsOfflineMaxBatteryVolts, "V", 12.0, 15.0) {
+                onSettingsChanged(settings.copy(bmsOfflineMaxBatteryVolts = it))
+            }
             NumberFieldRow("SOC hold current", settings.socHoldCurrentAmps, "A", 0.0, 5.0) {
                 onSettingsChanged(settings.copy(socHoldCurrentAmps = it))
             }
@@ -117,6 +120,12 @@ fun SettingsScreen(
             }
             NumberFieldRow("Knee step", settings.kneeStepVolts, "V", 0.01, 1.0) {
                 onSettingsChanged(settings.copy(kneeStepVolts = it))
+            }
+            NumberFieldRow("Fast probe crash knee backoff", settings.fastProbeRecoveryKneeBackVolts, "V", 0.05, 2.0) {
+                onSettingsChanged(settings.copy(fastProbeRecoveryKneeBackVolts = it))
+            }
+            NumberFieldRow("Probe recovery ISET recall", settings.probeRecoveryIsetFraction * 100.0, "%", 0.0, 100.0) {
+                onSettingsChanged(settings.copy(probeRecoveryIsetFraction = (it / 100.0).coerceIn(0.0, 1.0)))
             }
             NumberFieldRow("Knee delay min", settings.kneeTrackingDelayMinSeconds, "s", 0.0, 300.0) {
                 onSettingsChanged(
