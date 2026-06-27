@@ -142,7 +142,9 @@ class MainActivity : ComponentActivity() {
         appSettings = loadSettings()
         opsLogger = OpsLogger(filesDir)
         refreshOpsLogSummary()
-        opsLogger.logEvent(System.currentTimeMillis(), "App started")
+        if (appSettings.logEventsEnabled) {
+            opsLogger.logEvent(System.currentTimeMillis(), "App started")
+        }
         loadEnergy()
         dailyHealthStore = DailyHealthStore(this)
         dailyHealthStore.load(nowDayKey())
@@ -163,17 +165,23 @@ class MainActivity : ComponentActivity() {
             onState = { handleMpptControlState(it) },
             onEvent = { addControllerEvent(it) },
             onCollapseEntered = { scheduled, preCrash ->
-                if (!scheduled && preCrash != null) {
+                if (!scheduled && preCrash != null && appSettings.logSkyDisturbancesEnabled) {
                     skyDisturbanceStore.recordDisturbance(preCrash)
                     refreshDailyHealth()
                     addControllerEvent("Cloud crash #${dailyHealth.unscheduledCrashesToday} today")
                 }
             },
             onCrashEpisodeStart = { kind, preCrash, nowMs ->
-                crashLogStore.startEpisode(kind, preCrash, nowMs)
+                if (appSettings.logCrashEpisodesEnabled) {
+                    crashLogStore.startEpisode(kind, preCrash, nowMs)
+                } else {
+                    0
+                }
             },
             onCrashLogSample = { sample ->
-                crashLogStore.appendSample(sample)
+                if (appSettings.logCrashEpisodesEnabled) {
+                    crashLogStore.appendSample(sample)
+                }
             }
         )
         bmsBleScanner = BmsBleScanner(this) {
@@ -532,9 +540,9 @@ class MainActivity : ComponentActivity() {
         }
         if (state.kneeProbeFast != lastLoggedKneeProbeFast) {
             if (state.kneeProbeFast) {
-                addControllerEvent("VTune fast acquire started")
+                addControllerEvent("VTune probing started")
             } else {
-                addControllerEvent("VTune fast acquire ended")
+                addControllerEvent("VTune probing paused")
             }
             lastLoggedKneeProbeFast = state.kneeProbeFast
             forceTelemetry = true
@@ -637,7 +645,7 @@ class MainActivity : ComponentActivity() {
         val now = System.currentTimeMillis()
         val event = "${eventTimeFormat.format(now)}  $text"
         controllerEvents = (listOf(event) + controllerEvents).take(MAX_CONTROLLER_EVENTS)
-        if (::opsLogger.isInitialized) {
+        if (::opsLogger.isInitialized && appSettings.logEventsEnabled) {
             opsLogger.logEvent(now, text)
         }
     }
@@ -674,6 +682,7 @@ class MainActivity : ComponentActivity() {
 
     private fun maybeRecordOpsTelemetry(force: Boolean = false) {
         if (!::opsLogger.isInitialized) return
+        if (!appSettings.logTelemetryEnabled) return
         if (!opsTelemetryReady()) return
 
         val control = mpptControlState
@@ -894,6 +903,10 @@ class MainActivity : ComponentActivity() {
                     defaults.fastProbeRecoveryKneeBackVolts.toFloat()
                 )
             ).toDouble(),
+            cloudRecoveryKneeBackVolts = prefs.getFloat(
+                KEY_CLOUD_RECOVERY_KNEE_BACK_V,
+                defaults.cloudRecoveryKneeBackVolts.toFloat()
+            ).toDouble(),
             probeRecoveryIsetFraction = prefs.getFloat(
                 KEY_PROBE_RECOVERY_ISET_FRACTION,
                 defaults.probeRecoveryIsetFraction.toFloat()
@@ -920,16 +933,23 @@ class MainActivity : ComponentActivity() {
                 prefs.getFloat(KEY_KNEE_TRACKING_DELAY_MIN_S, defaults.kneeTrackingDelayMinSeconds.toFloat())
                     .toDouble()
             ),
-            fastAcquireSuccessCount = prefs.getInt(
-                KEY_FAST_ACQUIRE_SUCCESS_COUNT,
-                defaults.fastAcquireSuccessCount
-            ).coerceIn(1, 5),
             powerBasedVtuneStop = prefs.getBoolean(
                 KEY_POWER_BASED_VTUNE_STOP,
                 defaults.powerBasedVtuneStop
             ),
             controllerLoopMs = prefs.getInt(KEY_CONTROLLER_LOOP_MS, defaults.controllerLoopMs),
-            keepScreenOn = prefs.getBoolean(KEY_KEEP_SCREEN_ON, defaults.keepScreenOn)
+            keepScreenOn = prefs.getBoolean(KEY_KEEP_SCREEN_ON, defaults.keepScreenOn),
+            logEventsEnabled = prefs.getBoolean(KEY_LOG_EVENTS_ENABLED, defaults.logEventsEnabled),
+            logTelemetryEnabled = prefs.getBoolean(KEY_LOG_TELEMETRY_ENABLED, defaults.logTelemetryEnabled),
+            logSkyDisturbancesEnabled = prefs.getBoolean(
+                KEY_LOG_SKY_DISTURBANCES_ENABLED,
+                defaults.logSkyDisturbancesEnabled
+            ),
+            logCrashEpisodesEnabled = prefs.getBoolean(
+                KEY_LOG_CRASH_EPISODES_ENABLED,
+                defaults.logCrashEpisodesEnabled
+            ),
+            logHistoryEnabled = prefs.getBoolean(KEY_LOG_HISTORY_ENABLED, defaults.logHistoryEnabled)
         )
     }
 
@@ -950,13 +970,18 @@ class MainActivity : ComponentActivity() {
             putFloat(KEY_MAX_TARGET_PV_V, settings.maxTargetPvVolts.toFloat())
             putFloat(KEY_KNEE_STEP_V, settings.kneeStepVolts.toFloat())
             putFloat(KEY_FAST_PROBE_RECOVERY_KNEE_BACK_V, settings.fastProbeRecoveryKneeBackVolts.toFloat())
+            putFloat(KEY_CLOUD_RECOVERY_KNEE_BACK_V, settings.cloudRecoveryKneeBackVolts.toFloat())
             putFloat(KEY_PROBE_RECOVERY_ISET_FRACTION, settings.probeRecoveryIsetFraction.toFloat())
             putFloat(KEY_KNEE_TRACKING_DELAY_MIN_S, settings.kneeTrackingDelayMinSeconds.toFloat())
             putFloat(KEY_KNEE_TRACKING_DELAY_MAX_S, settings.kneeTrackingDelayMaxSeconds.toFloat())
-            putInt(KEY_FAST_ACQUIRE_SUCCESS_COUNT, settings.fastAcquireSuccessCount.coerceIn(1, 5))
             putBoolean(KEY_POWER_BASED_VTUNE_STOP, settings.powerBasedVtuneStop)
             putInt(KEY_CONTROLLER_LOOP_MS, settings.controllerLoopMs)
             putBoolean(KEY_KEEP_SCREEN_ON, settings.keepScreenOn)
+            putBoolean(KEY_LOG_EVENTS_ENABLED, settings.logEventsEnabled)
+            putBoolean(KEY_LOG_TELEMETRY_ENABLED, settings.logTelemetryEnabled)
+            putBoolean(KEY_LOG_SKY_DISTURBANCES_ENABLED, settings.logSkyDisturbancesEnabled)
+            putBoolean(KEY_LOG_CRASH_EPISODES_ENABLED, settings.logCrashEpisodesEnabled)
+            putBoolean(KEY_LOG_HISTORY_ENABLED, settings.logHistoryEnabled)
         }
     }
 
@@ -1139,6 +1164,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun maybeRecordHistory() {
+        if (!appSettings.logHistoryEnabled) return
         val nowMs = System.currentTimeMillis()
         if (mpptControlState.recoveryActive) {
             lastHistorySampleMs = nowMs
@@ -1277,6 +1303,7 @@ class MainActivity : ComponentActivity() {
         private const val KEY_MAX_TARGET_PV_V = "max_target_pv_v"
         private const val KEY_KNEE_STEP_V = "knee_step_v"
         private const val KEY_FAST_PROBE_RECOVERY_KNEE_BACK_V = "fast_probe_recovery_knee_back_v"
+        private const val KEY_CLOUD_RECOVERY_KNEE_BACK_V = "cloud_recovery_knee_back_v"
         private const val KEY_PROBE_RECOVERY_KNEE_BACK_V = "probe_recovery_knee_back_v"
         private const val KEY_PROBE_RECOVERY_ISET_FRACTION = "probe_recovery_iset_fraction"
         private const val KEY_HCC_QUIET_S = "hcc_quiet_s"
@@ -1287,6 +1314,11 @@ class MainActivity : ComponentActivity() {
         private const val KEY_POWER_BASED_VTUNE_STOP = "power_based_vtune_stop"
         private const val KEY_CONTROLLER_LOOP_MS = "controller_loop_ms"
         private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
+        private const val KEY_LOG_EVENTS_ENABLED = "log_events_enabled"
+        private const val KEY_LOG_TELEMETRY_ENABLED = "log_telemetry_enabled"
+        private const val KEY_LOG_SKY_DISTURBANCES_ENABLED = "log_sky_disturbances_enabled"
+        private const val KEY_LOG_CRASH_EPISODES_ENABLED = "log_crash_episodes_enabled"
+        private const val KEY_LOG_HISTORY_ENABLED = "log_history_enabled"
         private const val KEY_ENERGY_DAY_KEY = "energy_day_key"
         private const val KEY_ENERGY_TODAY_WH = "energy_today_wh"
         private const val KEY_ENERGY_YESTERDAY_WH = "energy_yesterday_wh"

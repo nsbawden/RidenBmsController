@@ -29,13 +29,15 @@ try {
 
     Write-Host ""
     Write-Banner -Title "SYNCALL - building charts" -Color Green
-    Write-Host ""
 
+    Write-ChartStatus "Sky disturbance charts" DarkGray
     & "$PSScriptRoot\graph_sky_logs.ps1"
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
 
+    Write-Host ""
+    Write-ChartStatus "Crash episode charts" DarkGray
     & "$PSScriptRoot\graph_crash_logs.ps1"
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
@@ -43,7 +45,8 @@ try {
 
     Write-Host ""
     Write-Banner -Title "SYNCALL SUCCEEDED" -Color Green
-    Write-Host "Logs and charts are in: $(Join-Path $PSScriptRoot 'pulled_logs')" -ForegroundColor Green
+    Write-Host "Today's logs and charts: $(Join-Path $PSScriptRoot 'pulled_logs')" -ForegroundColor Green
+    Write-Host "Archive: $(Join-Path $PSScriptRoot 'pulled_logs\archive')" -ForegroundColor Green
     Write-Host ""
 }
 finally {

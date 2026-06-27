@@ -124,7 +124,10 @@ fun SettingsScreen(
             NumberFieldRow("Fast probe crash knee backoff", settings.fastProbeRecoveryKneeBackVolts, "V", 0.05, 2.0) {
                 onSettingsChanged(settings.copy(fastProbeRecoveryKneeBackVolts = it))
             }
-            NumberFieldRow("Probe recovery ISET recall", settings.probeRecoveryIsetFraction * 100.0, "%", 0.0, 100.0) {
+            NumberFieldRow("Cloud crash knee backoff", settings.cloudRecoveryKneeBackVolts, "V", 0.05, 2.0) {
+                onSettingsChanged(settings.copy(cloudRecoveryKneeBackVolts = it))
+            }
+            NumberFieldRow("Recovery ISET recall", settings.probeRecoveryIsetFraction * 100.0, "%", 0.0, 100.0) {
                 onSettingsChanged(settings.copy(probeRecoveryIsetFraction = (it / 100.0).coerceIn(0.0, 1.0)))
             }
             NumberFieldRow("Knee delay min", settings.kneeTrackingDelayMinSeconds, "s", 0.0, 300.0) {
@@ -140,9 +143,6 @@ fun SettingsScreen(
                         kneeTrackingDelayMaxSeconds = it.coerceAtLeast(settings.kneeTrackingDelayMinSeconds)
                     )
                 )
-            }
-            IntFieldRow("Fast acquire after", settings.fastAcquireSuccessCount, "stable probes", 1, 5) {
-                onSettingsChanged(settings.copy(fastAcquireSuccessCount = it))
             }
             ToggleRow("Power-based VTune stop", settings.powerBasedVtuneStop) {
                 onSettingsChanged(settings.copy(powerBasedVtuneStop = it))
@@ -176,6 +176,23 @@ fun SettingsScreen(
             ToggleRow("Auto reconnect", true) {}
             ToggleRow("Keep screen on", settings.keepScreenOn) {
                 onSettingsChanged(settings.copy(keepScreenOn = it))
+            }
+        }
+        SettingsGroup("Logging") {
+            ToggleRow("Events log", settings.logEventsEnabled) {
+                onSettingsChanged(settings.copy(logEventsEnabled = it))
+            }
+            ToggleRow("Telemetry log", settings.logTelemetryEnabled) {
+                onSettingsChanged(settings.copy(logTelemetryEnabled = it))
+            }
+            ToggleRow("Sky disturbances log", settings.logSkyDisturbancesEnabled) {
+                onSettingsChanged(settings.copy(logSkyDisturbancesEnabled = it))
+            }
+            ToggleRow("Crash episodes log", settings.logCrashEpisodesEnabled) {
+                onSettingsChanged(settings.copy(logCrashEpisodesEnabled = it))
+            }
+            ToggleRow("Controller history log", settings.logHistoryEnabled) {
+                onSettingsChanged(settings.copy(logHistoryEnabled = it))
             }
         }
         SettingsGroup("Energy counters") {

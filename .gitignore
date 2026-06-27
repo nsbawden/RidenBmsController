@@ -29,3 +29,5 @@ local.properties
 *.jks
 *.keystore
 
+# Synced phone logs and generated charts (synclogs.bat / syncall.ps1)
+/pulled_logs/

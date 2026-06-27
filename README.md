@@ -97,3 +97,18 @@ For a programmable MPPT controller, the Riden adapter is the main piece to repla
 ## Safety
 
 This app controls real charging hardware. Use conservative voltage and current limits, verify BMS alarm behavior, and test with supervision before leaving a system unattended. The BMS should remain the final hardware-level protection layer; this app is an additional controller, not a replacement for proper battery protection.
+
+## Connecting to phone after phone is pared using Android Studio
+
+**make sure wireless debugging is turned on for the phone**
+
+```
+> adb start-server
+... wait
+> adb devices
+should show 
+adb-RFCN70E0X1J-ib6pkA._adb-tls-connect._tcp    device
+> adb shell settings get global device_name
+should show
+Nathan's Galaxy Note20 5G
+```

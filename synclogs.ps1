@@ -1,7 +1,6 @@
 # Sync ops_logs from connected phone to pulled_logs/.
-# Daily files: *_telemetry*.csv, *_events.csv, *_sky_disturbances.csv, *_crash_episodes.csv
-# - Skips past-day files already on disk (re-downloads today always).
-# - Past-day: verify local copy matches phone (size); re-pull if not, then delete from phone.
+# Today's enabled logs -> pulled_logs/ (root). Past days -> pulled_logs/archive/, then removed from phone.
+# Root is pruned to match what the phone currently has for today (logging toggles off = file gone locally).
 
 param(
     [switch]$SkipLock
@@ -14,6 +13,7 @@ $ErrorActionPreference = "Stop"
 $Package = "com.example.ridenbmscontroller"
 $RemoteDir = "files/ops_logs"
 $DestDir = Join-Path $PSScriptRoot "pulled_logs"
+$ArchiveDir = Get-PulledLogsArchiveDir $DestDir
 $Today = Get-Date -Format "yyyy-MM-dd"
 $DailyLogPattern = '^(?<date>\d{4}-\d{2}-\d{2})_(?<rest>.+\.csv)$'
 $SkyLogPattern = '_sky_disturbances\.csv$'
@@ -58,6 +58,11 @@ function Get-RemoteLogFiles {
 
 function Pull-RemoteFile {
     param([string]$RemoteName, [string]$LocalPath)
+
+    $parent = Split-Path $LocalPath -Parent
+    if ($parent -and -not (Test-Path $parent)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "adb"
@@ -139,6 +144,11 @@ function Ensure-LocalArchiveMatchesPhone {
         [string]$KindTag
     )
 
+    $legacyPath = Join-Path $DestDir $RemoteName
+    if ((Split-Path $LocalPath -Parent) -ne $DestDir -and (Test-Path $legacyPath)) {
+        Move-PulledLogFileToArchive -SourcePath $legacyPath -ArchiveDir $ArchiveDir
+    }
+
     $remote = Get-RemoteFileStat -RemoteName $RemoteName
     if ($null -eq $remote) {
         Write-Step "  -> cannot read phone size for $RemoteName; re-pulling before delete ..."
@@ -147,30 +157,35 @@ function Ensure-LocalArchiveMatchesPhone {
             return [PSCustomObject]@{ Ready = $false; Pulled = $false }
         }
         $size = (Get-Item $LocalPath).Length
-        Write-Step "  -> re-pulled ($size bytes)"
+        Write-Step "  -> re-pulled ($size bytes) -> archive"
         return [PSCustomObject]@{ Ready = $true; Pulled = $true }
     }
 
     $remoteStamp = Format-RemoteStamp $remote.ModifiedUtc
-    if (-not (Test-Path $LocalPath)) {
-        Write-Step "Pulling $RemoteName ($KindTag archive, phone $($remote.Size) bytes @ $remoteStamp) ..."
+    $existingPath = Find-PulledLogLocalPath -RootDir $DestDir -FileName $RemoteName
+    if (-not (Test-Path $existingPath)) {
+        Write-Step "Pulling $RemoteName ($KindTag past day -> archive, phone $($remote.Size) bytes @ $remoteStamp) ..."
         if (-not (Pull-RemoteFile -RemoteName $RemoteName -LocalPath $LocalPath)) {
             Write-Step "  -> failed or empty; not deleting from phone"
             return [PSCustomObject]@{ Ready = $false; Pulled = $false }
         }
         $size = (Get-Item $LocalPath).Length
-        Write-Step "  -> saved ($size bytes)"
+        Write-Step "  -> saved to archive ($size bytes)"
         return [PSCustomObject]@{ Ready = $true; Pulled = $true }
+    }
+
+    if ($existingPath -ne $LocalPath) {
+        Move-PulledLogFileToArchive -SourcePath $existingPath -ArchiveDir $ArchiveDir
     }
 
     $local = Get-Item $LocalPath
     $localStamp = $local.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
     if ($local.Length -eq $remote.Size) {
-        Write-Step "Verified $RemoteName ($KindTag local $($local.Length) bytes @ $localStamp matches phone $($remote.Size) bytes @ $remoteStamp)"
+        Write-Step "Verified $RemoteName ($KindTag archive $($local.Length) bytes @ $localStamp matches phone $($remote.Size) bytes @ $remoteStamp)"
         return [PSCustomObject]@{ Ready = $true; Pulled = $false }
     }
 
-    Write-Step "Updating $RemoteName ($KindTag local $($local.Length) bytes @ $localStamp, phone $($remote.Size) bytes @ $remoteStamp) ..."
+    Write-Step "Updating $RemoteName ($KindTag archive $($local.Length) bytes @ $localStamp, phone $($remote.Size) bytes @ $remoteStamp) ..."
     if (-not (Pull-RemoteFile -RemoteName $RemoteName -LocalPath $LocalPath)) {
         Write-Step "  -> re-pull failed; not deleting from phone"
         return [PSCustomObject]@{ Ready = $false; Pulled = $false }
@@ -180,7 +195,7 @@ function Ensure-LocalArchiveMatchesPhone {
         Write-Step "  -> warning: after re-pull local is $size bytes but phone reports $($remote.Size); not deleting from phone"
         return [PSCustomObject]@{ Ready = $false; Pulled = $false }
     }
-    Write-Step "  -> re-pulled ($size bytes, matches phone)"
+    Write-Step "  -> re-pulled to archive ($size bytes, matches phone)"
     return [PSCustomObject]@{ Ready = $true; Pulled = $true }
 }
 
@@ -194,10 +209,13 @@ function Sync-OtherPhoneLogs {
     param([string]$RemoteName)
 
     $localPath = Join-Path $DestDir $RemoteName
-    Write-Step "Pulling $RemoteName (always refresh) ..."
+    Write-Step "Pulling $RemoteName (today, overwrite) ..."
     if (Pull-RemoteFile -RemoteName $RemoteName -LocalPath $localPath) {
         $size = (Get-Item $localPath).Length
-        Write-Step "  -> $RemoteName ($size bytes)"
+        Write-Step "  -> saved ($size bytes), kept on phone"
+    } elseif (Test-Path $localPath) {
+        Remove-Item $localPath -Force
+        Write-Step "  -> removed local copy (not on phone / logging off)"
     } else {
         Write-Step "  -> skip (missing or empty on phone)"
     }
@@ -210,6 +228,8 @@ if (-not $SkipLock) {
 }
 
 try {
+Initialize-PulledLogsLayout -RootDir $DestDir -Today $Today
+
 $adbReport = Get-AdbDeviceReport
 if (-not $adbReport.HasDevice) {
     Show-NoPhoneConnected -Report $adbReport
@@ -222,12 +242,11 @@ foreach ($id in $adbReport.Connected) {
 }
 Write-Host ""
 
-New-Item -ItemType Directory -Force -Path $DestDir | Out-Null
-
-Write-Step "synclogs: today=$Today dest=$DestDir"
+Write-Step "synclogs: today=$Today active=$DestDir archive=$ArchiveDir"
 Write-Step ""
 
 $remoteFiles = Get-RemoteLogFiles
+$remoteNames = @($remoteFiles | ForEach-Object { $_.Name })
 $skyPulled = 0
 $skyCleared = 0
 $crashPulled = 0
@@ -236,7 +255,7 @@ if ($remoteFiles.Count -eq 0) {
     Write-Step "No daily ops_logs/*.csv files found on phone (telemetry, events, sky_disturbances, crash_episodes)."
 } else {
     foreach ($file in $remoteFiles) {
-        $localPath = Join-Path $DestDir $file.Name
+        $localPath = Resolve-PulledLogLocalPath -RootDir $DestDir -FileName $file.Name -FileDate $file.Date -Today $Today
         $isToday = $file.Date -eq $Today
         $kind = Get-LogKindLabel $file.Name
         $kindTag = switch ($kind) {
@@ -253,7 +272,11 @@ if ($remoteFiles.Count -eq 0) {
                 if ($kind -eq "sky") { $skyPulled += 1 }
                 if ($kind -eq "crash") { $crashPulled += 1 }
             } else {
-                Write-Step "  -> failed or empty"
+                Remove-PulledLogSiblingHtml $localPath
+                if (Test-Path $localPath) {
+                    Remove-Item $localPath -Force
+                }
+                Write-Step "  -> removed local copy (empty or missing on phone)"
             }
             continue
         }
@@ -284,10 +307,20 @@ Write-Step "Sky disturbance logs: pulled/updated $skyPulled, cleared from phone 
 Write-Step "Crash episode logs: pulled/updated $crashPulled, cleared from phone $crashCleared"
 Write-Step ""
 Sync-OtherPhoneLogs -RemoteName "controller_history.csv"
+if ((Get-RemoteFileStat -RemoteName "controller_history.csv") -ne $null) {
+    if ($remoteNames -notcontains "controller_history.csv") {
+        $remoteNames += "controller_history.csv"
+    }
+} else {
+    $remoteNames = @($remoteNames | Where-Object { $_ -ne "controller_history.csv" })
+}
+Remove-PulledLogsTodayNotOnPhone -RootDir $DestDir -Today $Today -RemoteNames $remoteNames
+Move-PulledLogsStaleRootToArchive -RootDir $DestDir -Today $Today
 
 Write-Step ""
 Write-Banner -Title "SYNClogs SUCCEEDED" -Color Green
-Write-Host "Logs saved to: $DestDir" -ForegroundColor Green
+Write-Host "Today's logs: $DestDir" -ForegroundColor Green
+Write-Host "Archive:      $ArchiveDir" -ForegroundColor Green
 Write-Host ""
 }
 finally {

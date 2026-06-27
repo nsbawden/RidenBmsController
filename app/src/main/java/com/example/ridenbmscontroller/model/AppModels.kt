@@ -96,13 +96,18 @@ data class AppSettings(
     val maxTargetPvVolts: Double,
     val kneeStepVolts: Double,
     val fastProbeRecoveryKneeBackVolts: Double,
+    val cloudRecoveryKneeBackVolts: Double,
     val probeRecoveryIsetFraction: Double,
     val kneeTrackingDelayMinSeconds: Double,
     val kneeTrackingDelayMaxSeconds: Double,
-    val fastAcquireSuccessCount: Int,
     val powerBasedVtuneStop: Boolean,
     val controllerLoopMs: Int,
-    val keepScreenOn: Boolean
+    val keepScreenOn: Boolean,
+    val logEventsEnabled: Boolean = true,
+    val logTelemetryEnabled: Boolean = true,
+    val logSkyDisturbancesEnabled: Boolean = true,
+    val logCrashEpisodesEnabled: Boolean = true,
+    val logHistoryEnabled: Boolean = true
 )
 
 data class HistoryPoint(
@@ -207,13 +212,18 @@ data class AppState(
                 maxTargetPvVolts = 36.0,
                 kneeStepVolts = 0.10,
                 fastProbeRecoveryKneeBackVolts = 0.50,
+                cloudRecoveryKneeBackVolts = 0.50,
                 probeRecoveryIsetFraction = 0.80,
                 kneeTrackingDelayMinSeconds = 30.0,
                 kneeTrackingDelayMaxSeconds = 300.0,
-                fastAcquireSuccessCount = 2,
                 powerBasedVtuneStop = false,
                 controllerLoopMs = 200,
-                keepScreenOn = true
+                keepScreenOn = true,
+                logEventsEnabled = true,
+                logTelemetryEnabled = true,
+                logSkyDisturbancesEnabled = true,
+                logCrashEpisodesEnabled = true,
+                logHistoryEnabled = true
             ),
             history = emptyList(),
             events = emptyList(),

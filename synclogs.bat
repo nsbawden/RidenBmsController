@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-REM Pull ops_logs to pulled_logs\ (telemetry, events, sky_disturbances, crash_episodes).
+REM Pull ops_logs: today -> pulled_logs\, past days -> pulled_logs\archive\
 REM Past-day files: verify local size matches phone before delete; re-pull if not.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0synclogs.ps1" %*
 set ERR=%ERRORLEVEL%

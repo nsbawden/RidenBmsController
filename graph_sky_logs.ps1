@@ -9,6 +9,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $DestDir = Join-Path $PSScriptRoot "pulled_logs"
+. "$PSScriptRoot\sync_common.ps1"
 
 function Parse-NullableDouble {
     param([string]$Text)
@@ -383,7 +384,7 @@ $tableRows
 "@
 
     [System.IO.File]::WriteAllText($HtmlPath, $html, [System.Text.UTF8Encoding]::new($false))
-    Write-Host "Wrote $HtmlPath ($($rows.Count) events)"
+    Write-ChartStatus "  Wrote $HtmlPath ($($rows.Count) events)" Green
 }
 
 if (-not (Test-Path $DestDir)) {
@@ -397,7 +398,7 @@ if ($Date -ne "") {
         Write-Error "Use date format YYYY-MM-DD (got: $Date)"
         exit 1
     }
-    $csvFiles += Join-Path $DestDir "${Date}_sky_disturbances.csv"
+    $csvFiles += Resolve-PulledLogCsvPath -RootDir $DestDir -Date $Date -Suffix "sky_disturbances"
 } else {
     $csvFiles += Get-ChildItem -Path $DestDir -Filter "*_sky_disturbances.csv" | Sort-Object Name
 }
@@ -409,23 +410,26 @@ if ($csvFiles.Count -eq 0) {
 
 $built = 0
 $skipped = 0
+Write-ChartStatus "Checking $($csvFiles.Count) sky chart(s)..." DarkGray
 foreach ($item in $csvFiles) {
     $csvPath = if ($item -is [string]) { $item } else { $item.FullName }
     if (-not (Test-Path $csvPath)) {
-        Write-Host "Missing: $csvPath"
+        Write-ChartStatus "Missing: $csvPath" Yellow
         continue
     }
     $htmlPath = $csvPath -replace '\.csv$', '.html'
+    $htmlLeaf = Split-Path $htmlPath -Leaf
     $csvFile = Get-Item $csvPath
     if (-not $Force -and (Test-SkyHtmlUpToDate -HtmlPath $htmlPath -CsvPath $csvPath)) {
-        Write-Host "Up to date: $(Split-Path $htmlPath -Leaf)"
+        Write-ChartStatus "Up to date: $htmlLeaf" DarkGray
         $skipped += 1
         continue
     }
     $dateLabel = $csvFile.BaseName -replace '_sky_disturbances$', ''
+    Write-ChartStatus "Building: $htmlLeaf ..." Cyan
     Write-SkyHtml -CsvPath $csvPath -HtmlPath $htmlPath -DateLabel $dateLabel
     $built += 1
 }
 
 Write-Host ""
-Write-Host "Done: built $built, skipped $skipped (HTML newer than CSV)"
+Write-ChartStatus "Done: built $built, skipped $skipped (HTML newer than CSV)" Green

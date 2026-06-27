@@ -1,18 +1,36 @@
 ---
-description: Install debug builds to the phone and relaunch the app after updating
+description: After app code changes, deploy to the phone and relaunch MPPT
 alwaysApply: true
 ---
 
 # Phone deploy and relaunch
 
-When installing or updating the app on a connected phone (USB or wireless ADB):
+When you change anything that affects the Android app (Kotlin, Compose UI, resources, manifest, `app/build.gradle`, etc.), **do not stop at compile-only**. Deploy and relaunch on the connected phone before considering the task done.
 
-1. Build and install from the project root:
+## When to deploy
+
+Deploy after any task that modifies app behavior or UI, including bug fixes, new settings, controller logic, and logging changes.
+
+Skip deploy only when:
+- The change is docs/scripts/sync only (no APK impact), or
+- No device is connected (`adb devices` empty) — say so and offer to deploy when a device is available, or
+- The user explicitly asked not to install.
+
+## Steps
+
+From the project root:
+
+1. Confirm a device is connected:
+   ```powershell
+   adb devices
+   ```
+2. Build and install:
    ```powershell
    .\gradlew.bat installDebug
    ```
-2. **Always relaunch the app after install.** `installDebug` replaces the APK but does not open the app; the user may think it disappeared (launcher name is **MPPT**).
+3. **Always relaunch after install.** `installDebug` replaces the APK but does not open the app; the launcher name is **MPPT**.
    ```powershell
    adb shell am start -n com.example.ridenbmscontroller/.MainActivity
    ```
-3. Confirm the device is connected first: `adb devices`
+
+If install fails, fix the build error and retry. Do not tell the user to check the phone until deploy + relaunch have succeeded (or you have reported why they could not run).

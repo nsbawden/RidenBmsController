@@ -114,3 +114,150 @@ function Exit-SyncLock {
         Remove-Item $script:SyncLockPath -Force -ErrorAction SilentlyContinue
     }
 }
+
+function Write-ChartStatus {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ConsoleColor]$Color = [ConsoleColor]::Gray
+    )
+    Write-Host $Message -ForegroundColor $Color
+    [Console]::Out.Flush()
+}
+
+# pulled_logs layout: today's active logs in root; older logs in pulled_logs/archive/
+$script:DailyLogNamePattern = '^(?<date>\d{4}-\d{2}-\d{2})_(?<rest>.+)$'
+
+function Get-PulledLogsArchiveDir {
+    param([Parameter(Mandatory)][string]$RootDir)
+    return Join-Path $RootDir "archive"
+}
+
+function Initialize-PulledLogsLayout {
+    param(
+        [Parameter(Mandatory)][string]$RootDir,
+        [string]$Today = (Get-Date -Format "yyyy-MM-dd")
+    )
+
+    $archiveDir = Get-PulledLogsArchiveDir $RootDir
+    New-Item -ItemType Directory -Force -Path $RootDir, $archiveDir | Out-Null
+    Move-PulledLogsStaleRootToArchive -RootDir $RootDir -Today $Today
+}
+
+function Move-PulledLogFileToArchive {
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$ArchiveDir
+    )
+
+    if (-not (Test-Path $SourcePath)) { return }
+
+    New-Item -ItemType Directory -Force -Path $ArchiveDir | Out-Null
+    $name = Split-Path $SourcePath -Leaf
+    $dest = Join-Path $ArchiveDir $name
+    if (Test-Path $dest) {
+        $srcLen = (Get-Item $SourcePath).Length
+        $destLen = (Get-Item $dest).Length
+        if ($srcLen -le $destLen) {
+            Remove-Item $SourcePath -Force
+            return
+        }
+        Remove-Item $dest -Force
+    }
+    Move-Item -Force $SourcePath $dest
+}
+
+function Move-PulledLogsStaleRootToArchive {
+    param(
+        [Parameter(Mandatory)][string]$RootDir,
+        [Parameter(Mandatory)][string]$Today
+    )
+
+    $archiveDir = Get-PulledLogsArchiveDir $RootDir
+    Get-ChildItem -Path $RootDir -File | ForEach-Object {
+        if ($_.Name -eq "controller_history.csv") { return }
+        if ($_.Name -notmatch $script:DailyLogNamePattern) { return }
+        if ($Matches.date -eq $Today) { return }
+        Move-PulledLogFileToArchive -SourcePath $_.FullName -ArchiveDir $archiveDir
+    }
+}
+
+function Resolve-PulledLogLocalPath {
+    param(
+        [Parameter(Mandatory)][string]$RootDir,
+        [Parameter(Mandatory)][string]$FileName,
+        [Parameter(Mandatory)][string]$FileDate,
+        [Parameter(Mandatory)][string]$Today
+    )
+
+    if ($FileDate -eq $Today) {
+        return Join-Path $RootDir $FileName
+    }
+    return Join-Path (Get-PulledLogsArchiveDir $RootDir) $FileName
+}
+
+function Find-PulledLogLocalPath {
+    param(
+        [Parameter(Mandatory)][string]$RootDir,
+        [Parameter(Mandatory)][string]$FileName
+    )
+
+    $archivePath = Join-Path (Get-PulledLogsArchiveDir $RootDir) $FileName
+    if (Test-Path $archivePath) { return $archivePath }
+
+    $rootPath = Join-Path $RootDir $FileName
+    if (Test-Path $rootPath) { return $rootPath }
+
+    return $archivePath
+}
+
+function Remove-PulledLogSiblingHtml {
+    param([Parameter(Mandatory)][string]$CsvPath)
+
+    $htmlPath = $CsvPath -replace '\.csv$', '.html'
+    if (Test-Path $htmlPath) {
+        Remove-Item $htmlPath -Force
+    }
+}
+
+function Resolve-PulledLogCsvPath {
+    param(
+        [Parameter(Mandatory)][string]$RootDir,
+        [Parameter(Mandatory)][string]$Date,
+        [Parameter(Mandatory)][string]$Suffix
+    )
+
+    $fileName = "${Date}_${Suffix}.csv"
+    $rootPath = Join-Path $RootDir $fileName
+    if (Test-Path $rootPath) { return $rootPath }
+
+    $archivePath = Join-Path (Get-PulledLogsArchiveDir $RootDir) $fileName
+    if (Test-Path $archivePath) { return $archivePath }
+
+    return $rootPath
+}
+
+function Remove-PulledLogsTodayNotOnPhone {
+    param(
+        [Parameter(Mandatory)][string]$RootDir,
+        [Parameter(Mandatory)][string]$Today,
+        [Parameter(Mandatory)][string[]]$RemoteNames
+    )
+
+    $remoteSet = [System.Collections.Generic.HashSet[string]]::new([string[]]$RemoteNames)
+    Get-ChildItem -Path $RootDir -File | ForEach-Object {
+        if ($_.Name -eq "controller_history.csv") {
+            if (-not $remoteSet.Contains($_.Name)) {
+                Remove-Item $_.FullName -Force
+            }
+            return
+        }
+        if ($_.Name -notmatch "^(?<date>$([regex]::Escape($Today)))_(?<rest>.+\.(csv|html))$") {
+            return
+        }
+        if ($_.Extension -eq ".html") { return }
+        if (-not $remoteSet.Contains($_.Name)) {
+            Remove-PulledLogSiblingHtml $_.FullName
+            Remove-Item $_.FullName -Force
+        }
+    }
+}

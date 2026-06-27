@@ -9,6 +9,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $DestDir = Join-Path $PSScriptRoot "pulled_logs"
+. "$PSScriptRoot\sync_common.ps1"
 
 function Parse-NullableDouble {
     param([string]$Text)
@@ -70,30 +71,14 @@ function Escape-Html {
     return [System.Net.WebUtility]::HtmlEncode($Text)
 }
 
-function Build-DaySeriesAndEpisodeMeta {
+function Build-EpisodeChartsData {
     param($SortedRows)
 
-    $times = New-Object System.Collections.Generic.List[string]
-    $episodeIds = New-Object System.Collections.Generic.List[string]
-    $iout = New-Object System.Collections.Generic.List[string]
-    $vin = New-Object System.Collections.Generic.List[string]
-    $vtran = New-Object System.Collections.Generic.List[string]
-    $iset = New-Object System.Collections.Generic.List[string]
     $episodeMeta = @{}
-    $prevEpisode = $null
     $dayMinTs = [long]::MaxValue
     $dayMaxTs = [long]::MinValue
 
     foreach ($row in $SortedRows) {
-        if ($null -ne $prevEpisode -and $row.EpisodeId -ne $prevEpisode) {
-            [void]$times.Add('null')
-            [void]$episodeIds.Add('null')
-            [void]$iout.Add('null')
-            [void]$vin.Add('null')
-            [void]$vtran.Add('null')
-            [void]$iset.Add('null')
-        }
-
         $id = $row.EpisodeId
         if (-not $episodeMeta.ContainsKey($id)) {
             $episodeMeta[$id] = @{
@@ -102,8 +87,11 @@ function Build-DaySeriesAndEpisodeMeta {
                 Last = $row
                 Count = 0
                 PeakIout = $null
-                RangeMin = [long]::MaxValue
-                RangeMax = [long]::MinValue
+                Times = New-Object System.Collections.Generic.List[string]
+                Iout = New-Object System.Collections.Generic.List[string]
+                Vin = New-Object System.Collections.Generic.List[string]
+                Vtran = New-Object System.Collections.Generic.List[string]
+                Iset = New-Object System.Collections.Generic.List[string]
             }
         }
         $meta = $episodeMeta[$id]
@@ -112,20 +100,15 @@ function Build-DaySeriesAndEpisodeMeta {
 
         if ($row.EpisodeStart -and $null -ne $row.PreVinV) {
             $preTs = $row.TimestampMs - 200
-            if ($preTs -lt $meta.RangeMin) { $meta.RangeMin = $preTs }
-            if ($preTs -gt $meta.RangeMax) { $meta.RangeMax = $preTs }
             if ($preTs -lt $dayMinTs) { $dayMinTs = $preTs }
             if ($preTs -gt $dayMaxTs) { $dayMaxTs = $preTs }
-            [void]$times.Add("$preTs")
-            [void]$episodeIds.Add("$id")
-            [void]$iout.Add((ConvertTo-JsonNumber $row.PreIoutA))
-            [void]$vin.Add((ConvertTo-JsonNumber $row.PreVinV))
-            [void]$vtran.Add((ConvertTo-JsonNumber $row.PreVtranV))
-            [void]$iset.Add((ConvertTo-JsonNumber $row.CommandIsetA))
+            [void]$meta.Times.Add("$preTs")
+            [void]$meta.Iout.Add((ConvertTo-JsonNumber $row.PreIoutA))
+            [void]$meta.Vin.Add((ConvertTo-JsonNumber $row.PreVinV))
+            [void]$meta.Vtran.Add((ConvertTo-JsonNumber $row.PreVtranV))
+            [void]$meta.Iset.Add((ConvertTo-JsonNumber $row.CommandIsetA))
         }
 
-        if ($row.TimestampMs -lt $meta.RangeMin) { $meta.RangeMin = $row.TimestampMs }
-        if ($row.TimestampMs -gt $meta.RangeMax) { $meta.RangeMax = $row.TimestampMs }
         if ($row.TimestampMs -lt $dayMinTs) { $dayMinTs = $row.TimestampMs }
         if ($row.TimestampMs -gt $dayMaxTs) { $dayMaxTs = $row.TimestampMs }
         if ($null -ne $row.IoutA) {
@@ -134,26 +117,31 @@ function Build-DaySeriesAndEpisodeMeta {
             }
         }
 
-        [void]$times.Add("$($row.TimestampMs)")
-        [void]$episodeIds.Add("$id")
-        [void]$iout.Add((ConvertTo-JsonNumber $row.IoutA))
-        [void]$vin.Add((ConvertTo-JsonNumber $row.VinV))
-        [void]$vtran.Add((ConvertTo-JsonNumber $row.VtranV))
-        [void]$iset.Add((ConvertTo-JsonNumber $row.CommandIsetA))
-        $prevEpisode = $id
+        [void]$meta.Times.Add("$($row.TimestampMs)")
+        [void]$meta.Iout.Add((ConvertTo-JsonNumber $row.IoutA))
+        [void]$meta.Vin.Add((ConvertTo-JsonNumber $row.VinV))
+        [void]$meta.Vtran.Add((ConvertTo-JsonNumber $row.VtranV))
+        [void]$meta.Iset.Add((ConvertTo-JsonNumber $row.CommandIsetA))
     }
 
     return @{
-        TimesJson = [string]::Join(',', $times)
-        EpisodeIdsJson = [string]::Join(',', ($episodeIds | ForEach-Object { if ($_ -eq 'null') { 'null' } else { $_ } }))
-        IoutJson = [string]::Join(',', $iout)
-        VinJson = [string]::Join(',', $vin)
-        VtranJson = [string]::Join(',', $vtran)
-        IsetJson = [string]::Join(',', $iset)
         MinTs = $dayMinTs
         MaxTs = $dayMaxTs
         EpisodeMeta = $episodeMeta
     }
+}
+
+function Build-EpisodesJson {
+    param($EpisodeMeta)
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($id in ($EpisodeMeta.Keys | Sort-Object { [int]$_ })) {
+        $meta = $EpisodeMeta[$id]
+        $parts.Add(@"
+"$id":{"times":[$( $meta.Times -join ',' )],"iout":[$( $meta.Iout -join ',' )],"vin":[$( $meta.Vin -join ',' )],"vtran":[$( $meta.Vtran -join ',' )],"iset":[$( $meta.Iset -join ',' )]}
+"@.Trim())
+    }
+    return '{ ' + ($parts -join ', ') + ' }'
 }
 
 function Read-CrashRows {
@@ -195,21 +183,26 @@ function Write-CrashHtml {
     )
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-ChartStatus "  reading CSV..." DarkGray
     $rows = Read-CrashRows $CsvPath
     if ($rows.Count -eq 0) {
         Write-Warning "No data rows in $CsvPath"
         return
     }
 
+    Write-ChartStatus "  building series ($($rows.Count) ticks)..." DarkGray
     $sortedRows = [array]($rows | Sort-Object TimestampMs)
-    $built = Build-DaySeriesAndEpisodeMeta $sortedRows
+    $built = Build-EpisodeChartsData $sortedRows
     $dayMinTs = $built.MinTs
     $dayMaxTs = $built.MaxTs
     $firstLabel = Format-DateTimeLabel $dayMinTs
     $lastLabel = Format-DateTimeLabel $dayMaxTs
 
-    $episodeMeta = @("            <option value=`"all`" selected>All day (full timeline)</option>")
+    $episodeMeta = @()
+    $defaultEpisodeId = $null
+    $idx = 0
     foreach ($id in ($built.EpisodeMeta.Keys | Sort-Object { [int]$_ } -Descending)) {
+        if ($null -eq $defaultEpisodeId) { $defaultEpisodeId = $id }
         $meta = $built.EpisodeMeta[$id]
         $first = $meta.First
         $last = $meta.Last
@@ -217,8 +210,11 @@ function Write-CrashHtml {
         $peak = if ($null -ne $meta.PeakIout) { "{0:N2}" -f $meta.PeakIout } else { "n/a" }
         $kind = Escape-Html $first.EpisodeKind
         $start = Escape-Html (Format-DateTimeLabel $first.TimestampMs)
-        $episodeMeta += "            <option value=`"$id`">#$id $kind @ $start ($($meta.Count) samples, ${durationSec}s, peak $peak A)</option>"
+        $selected = if ($idx -eq 0) { " selected" } else { "" }
+        $episodeMeta += "            <option value=`"$id`"$selected>#$id $kind @ $start ($($meta.Count) samples, ${durationSec}s, peak $peak A)</option>"
+        $idx++
     }
+    $episodesJson = Build-EpisodesJson $built.EpisodeMeta
 
     $generatedAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $csvName = Split-Path $CsvPath -Leaf
@@ -226,6 +222,8 @@ function Write-CrashHtml {
     $episodeCount = $built.EpisodeMeta.Count
     $tickCount = $rows.Count
     $episodeOptions = $episodeMeta -join "`n"
+    if ($null -eq $defaultEpisodeId) { $defaultEpisodeId = "0" }
+    Write-ChartStatus "  writing HTML..." DarkGray
     $utf8 = New-Object System.Text.UTF8Encoding $false
     $writer = New-Object System.IO.StreamWriter($HtmlPath, $false, $utf8)
     try {
@@ -315,7 +313,7 @@ function Write-CrashHtml {
 <body>
     <header>
         <h1>Crash episodes - $DateLabel</h1>
-        <p>Full-day view uses real time. Episode focus evenly spaces samples (gaps smoothed). One log row per Riden poll.</p>
+        <p>One episode per chart. Samples are evenly spaced; tooltip shows real time. One log row per Riden poll.</p>
     </header>
     <main>
         <div class="stats">
@@ -326,52 +324,22 @@ function Write-CrashHtml {
         </div>
 
         <section class="card">
-            <h2>Day timeline</h2>
+            <h2>Episode</h2>
             <div class="controls">
-                <label for="episodeSelect">Focus:</label>
+                <label for="episodeSelect">Episode:</label>
                 <select id="episodeSelect">
 $episodeOptions
                 </select>
-                <button type="button" id="resetZoomBtn">All day</button>
+                <button type="button" id="resetZoomBtn">Reset zoom</button>
             </div>
-            <p class="legend-note">All day: linear time (gaps between episodes). Episode focus: contiguous samples, real time in tooltip. Left: IOUT + ISET (A). Right: Vin, VTran (V).</p>
+            <p class="legend-note">Left: IOUT + ISET (A). Right: Vin, VTran (V).</p>
             <div class="chart-wrap"><canvas id="crashChart"></canvas></div>
             <p class="note">Source: $csvName - Generated $generatedAt</p>
         </section>
     </main>
     <script>
-        const dayMinTs = $dayMinTs;
-        const dayMaxTs = $dayMaxTs;
-        const dayTimes = [
-"@)
-        $writer.Write($built.TimesJson)
-        $writer.Write(@"
-];
-        const dayEpisodeIds = [
-"@)
-        $writer.Write($built.EpisodeIdsJson)
-        $writer.Write(@"
-];
-        const dayIout = [
-"@)
-        $writer.Write($built.IoutJson)
-        $writer.Write(@"
-];
-        const dayVin = [
-"@)
-        $writer.Write($built.VinJson)
-        $writer.Write(@"
-];
-        const dayVtran = [
-"@)
-        $writer.Write($built.VtranJson)
-        $writer.Write(@"
-];
-        const dayIset = [
-"@)
-        $writer.Write($built.IsetJson)
-        $writer.Write(@"
-];
+        const episodes = $episodesJson;
+        const defaultEpisodeId = '$defaultEpisodeId';
 "@)
         $writer.Write($CrashChartScriptBody)
         $writer.WriteLine('</html>')
@@ -379,13 +347,12 @@ $episodeOptions
         $writer.Close()
     }
     $sw.Stop()
-    Write-Host "Wrote $HtmlPath ($episodeCount episodes, $tickCount ticks) in $($sw.Elapsed.TotalSeconds.ToString('0.0'))s"
+    Write-ChartStatus "  Wrote $HtmlPath ($episodeCount episodes, $tickCount ticks) in $($sw.Elapsed.TotalSeconds.ToString('0.0'))s" Green
 }
 
 $CrashChartScriptBody = @'
 
         let chart = null;
-        let viewMode = 'day';
         let episodeTimes = null;
 
         function formatTimeMs(ms) {
@@ -397,20 +364,6 @@ $CrashChartScriptBody = @'
             for (let i = 0; i < count; i++) {
                 const y = values[i];
                 pts.push({ x: i, y: (y === null || y === undefined) ? NaN : y });
-            }
-            return pts;
-        }
-
-        function seriesPoints(times, values) {
-            const pts = [];
-            for (let i = 0; i < times.length; i++) {
-                const x = times[i];
-                if (x === null || Number.isNaN(x)) {
-                    pts.push({ x: NaN, y: NaN });
-                    continue;
-                }
-                const y = values[i];
-                pts.push({ x: x, y: (y === null || y === undefined) ? NaN : y });
             }
             return pts;
         }
@@ -461,31 +414,15 @@ $CrashChartScriptBody = @'
             ];
         }
 
-        function buildDayDatasets() {
-            return buildLineDatasets({
-                iout: seriesPoints(dayTimes, dayIout),
-                iset: seriesPoints(dayTimes, dayIset),
-                vin: seriesPoints(dayTimes, dayVin),
-                vtran: seriesPoints(dayTimes, dayVtran)
-            }, false);
-        }
-
-        function episodeFromDay(id) {
-            const epId = parseInt(id, 10);
-            const times = [];
-            const iout = [];
-            const vin = [];
-            const vtran = [];
-            const iset = [];
-            for (let i = 0; i < dayEpisodeIds.length; i++) {
-                if (dayEpisodeIds[i] !== epId) continue;
-                times.push(dayTimes[i]);
-                iout.push(dayIout[i]);
-                vin.push(dayVin[i]);
-                vtran.push(dayVtran[i]);
-                iset.push(dayIset[i]);
-            }
-            return { times, iout, vin, vtran, iset, count: times.length };
+        function episodePayload(raw) {
+            return {
+                times: raw.times,
+                iout: raw.iout,
+                vin: raw.vin,
+                vtran: raw.vtran,
+                iset: raw.iset,
+                count: raw.times.length
+            };
         }
 
         function buildEpisodeDatasets(ep) {
@@ -495,67 +432,6 @@ $CrashChartScriptBody = @'
                 vin: seriesPointsIndexed(ep.count, ep.vin),
                 vtran: seriesPointsIndexed(ep.count, ep.vtran)
             }, true);
-        }
-
-        function chartOptionsDay() {
-            return {
-                responsive: true,
-                maintainAspectRatio: false,
-                interaction: { mode: 'index', intersect: false },
-                parsing: false,
-                plugins: {
-                    legend: { labels: { color: '#c5d0e0', usePointStyle: true } },
-                    tooltip: {
-                        callbacks: {
-                            title: function(items) {
-                                if (!items.length) return '';
-                                return new Date(items[0].parsed.x).toLocaleString();
-                            },
-                            label: function(ctx) {
-                                const v = ctx.parsed.y;
-                                if (v === null || Number.isNaN(v)) return ctx.dataset.label + ': n/a';
-                                const unit = ctx.dataset.yAxisID === 'yAmps' ? ' A' : ' V';
-                                return ctx.dataset.label + ': ' + v.toFixed(3) + unit;
-                            }
-                        }
-                    },
-                    zoom: {
-                        pan: { enabled: true, mode: 'x' },
-                        zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x' },
-                        limits: { x: { min: dayMinTs, max: dayMaxTs } }
-                    }
-                },
-                scales: {
-                    x: {
-                        type: 'linear',
-                        min: dayMinTs,
-                        max: dayMaxTs,
-                        title: { display: true, text: 'Time', color: '#8b9cb3' },
-                        ticks: {
-                            color: '#8b9cb3',
-                            maxRotation: 45,
-                            autoSkip: true,
-                            maxTicksLimit: 30,
-                            callback: function(value) { return formatTimeMs(value); }
-                        },
-                        grid: { color: 'rgba(42, 54, 72, 0.6)' }
-                    },
-                    yAmps: {
-                        type: 'linear',
-                        position: 'left',
-                        title: { display: true, text: 'Amps', color: '#f43f5e' },
-                        ticks: { color: '#f43f5e' },
-                        grid: { color: 'rgba(42, 54, 72, 0.6)' }
-                    },
-                    yVolts: {
-                        type: 'linear',
-                        position: 'right',
-                        title: { display: true, text: 'Volts', color: '#f59e0b' },
-                        ticks: { color: '#8b9cb3' },
-                        grid: { drawOnChartArea: false }
-                    }
-                }
-            };
         }
 
         function chartOptionsEpisode(times) {
@@ -627,26 +503,11 @@ $CrashChartScriptBody = @'
             };
         }
 
-        function showAllDay() {
-            if (!chart) return;
-            viewMode = 'day';
-            episodeTimes = null;
-            chart.data.datasets = buildDayDatasets();
-            chart.options = chartOptionsDay();
-            chart.resetZoom();
-            chart.update('none');
-            document.getElementById('episodeSelect').value = 'all';
-        }
-
         function focusEpisode(id) {
             if (!chart) return;
-            if (id === 'all') {
-                showAllDay();
-                return;
-            }
-            const ep = episodeFromDay(id);
-            if (!ep.count) return;
-            viewMode = 'episode';
+            const raw = episodes[id];
+            if (!raw || !raw.times || !raw.times.length) return;
+            const ep = episodePayload(raw);
             episodeTimes = ep.times;
             chart.data.datasets = buildEpisodeDatasets(ep);
             chart.options = chartOptionsEpisode(ep.times);
@@ -656,14 +517,16 @@ $CrashChartScriptBody = @'
 
         chart = new Chart(document.getElementById('crashChart'), {
             type: 'line',
-            data: { datasets: buildDayDatasets() },
-            options: chartOptionsDay()
+            data: { datasets: [] },
+            options: chartOptionsEpisode([])
         });
 
         const select = document.getElementById('episodeSelect');
         select.addEventListener('change', () => focusEpisode(select.value));
-        document.getElementById('resetZoomBtn').addEventListener('click', showAllDay);
-        showAllDay();
+        document.getElementById('resetZoomBtn').addEventListener('click', () => {
+            if (chart) chart.resetZoom();
+        });
+        focusEpisode(select.value || defaultEpisodeId);
     </script>
 </body>
 '@
@@ -679,7 +542,7 @@ if ($Date -ne "") {
         Write-Error "Use date format YYYY-MM-DD (got: $Date)"
         exit 1
     }
-    $csvFiles += Join-Path $DestDir "${Date}_crash_episodes.csv"
+    $csvFiles += Resolve-PulledLogCsvPath -RootDir $DestDir -Date $Date -Suffix "crash_episodes"
 } else {
     $csvFiles += Get-ChildItem -Path $DestDir -Filter "*_crash_episodes.csv" | Sort-Object Name
 }
@@ -691,23 +554,26 @@ if ($csvFiles.Count -eq 0) {
 
 $built = 0
 $skipped = 0
+Write-ChartStatus "Checking $($csvFiles.Count) crash chart(s)..." DarkGray
 foreach ($item in $csvFiles) {
     $csvPath = if ($item -is [string]) { $item } else { $item.FullName }
     if (-not (Test-Path $csvPath)) {
-        Write-Host "Missing: $csvPath"
+        Write-ChartStatus "Missing: $csvPath" Yellow
         continue
     }
     $htmlPath = $csvPath -replace '\.csv$', '.html'
+    $htmlLeaf = Split-Path $htmlPath -Leaf
     $csvFile = Get-Item $csvPath
     if (-not $Force -and (Test-CrashHtmlUpToDate -HtmlPath $htmlPath -CsvPath $csvPath)) {
-        Write-Host "Up to date: $(Split-Path $htmlPath -Leaf)"
+        Write-ChartStatus "Up to date: $htmlLeaf" DarkGray
         $skipped += 1
         continue
     }
     $dateLabel = $csvFile.BaseName -replace '_crash_episodes$', ''
+    Write-ChartStatus "Building: $htmlLeaf ..." Cyan
     Write-CrashHtml -CsvPath $csvPath -HtmlPath $htmlPath -DateLabel $dateLabel
     $built += 1
 }
 
 Write-Host ""
-Write-Host "Done: built $built, skipped $skipped (HTML newer than CSV)"
+Write-ChartStatus "Done: built $built, skipped $skipped (HTML newer than CSV)" Green
