@@ -48,11 +48,14 @@ fun SettingsScreen(
     settings: AppSettings,
     riden: RidenState,
     energy: EnergyCounters,
+    socDriftAh: Double = 0.0,
+    worstCaseSocPercent: Int? = null,
     onSettingsChanged: (AppSettings) -> Unit,
     balanceDayToday: Boolean,
     daysUntilNextBalance: Int,
     onToggleBalanceToday: () -> Unit,
     onResetEnergyTotal: () -> Unit,
+    onResetSocDrift: () -> Unit = {},
     onResetLearnedKnee: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -84,6 +87,21 @@ fun SettingsScreen(
             IntFieldRow("Low SOC alarm", settings.lowSocAlarmPercent, "%", 0, 100) {
                 onSettingsChanged(settings.copy(lowSocAlarmPercent = it))
             }
+            NumberFieldRow("Top-off battery current", settings.topOffMaxChargeAmps, "A", 0.5, 60.0) {
+                onSettingsChanged(settings.copy(topOffMaxChargeAmps = it))
+            }
+            ToggleRow("BMS voltage hold (experimental)", settings.bmsVoltageHoldEnabled) {
+                onSettingsChanged(settings.copy(bmsVoltageHoldEnabled = it))
+            }
+            ToggleRow("Hold with pack voltage", settings.holdWithPackVoltage) {
+                onSettingsChanged(settings.copy(holdWithPackVoltage = it))
+            }
+            NumberFieldRow("BMS hold voltage", settings.bmsVoltageHoldVolts, "V", 12.0, 15.0) {
+                onSettingsChanged(settings.copy(bmsVoltageHoldVolts = it))
+            }
+            NumberFieldRow("BMS hold end current", settings.bmsVoltageHoldEndCurrentAmps, "A", 0.1, 20.0) {
+                onSettingsChanged(settings.copy(bmsVoltageHoldEndCurrentAmps = it))
+            }
             IntFieldRow("Balance interval", settings.balanceEveryDays, "days", 1, 60) {
                 onSettingsChanged(settings.copy(balanceEveryDays = it))
             }
@@ -95,6 +113,25 @@ fun SettingsScreen(
                         "Force Balance Today (next in ${daysUntilNextBalance}d)"
                     }
                 )
+            }
+        }
+        SettingsGroup("SOC drift") {
+            NumberFieldRow("BMS zero deadband", settings.socDriftDeadbandAmps, "A", 0.0, 5.0) {
+                onSettingsChanged(settings.copy(socDriftDeadbandAmps = it))
+            }
+            IntFieldRow("Worst-case SOC alarm", settings.socDriftAlarmPercent, "%", 0, 100) {
+                onSettingsChanged(settings.copy(socDriftAlarmPercent = it))
+            }
+            SettingRow(
+                "Accumulated drift",
+                "%.2f Ah".format(socDriftAh)
+            )
+            SettingRow(
+                "Worst-case SOC",
+                worstCaseSocPercent?.let { "$it%" } ?: "—"
+            )
+            Button(onClick = onResetSocDrift, modifier = Modifier.fillMaxWidth()) {
+                Text("Reset SOC Drift")
             }
         }
         SettingsGroup("Solar control") {

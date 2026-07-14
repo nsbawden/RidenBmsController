@@ -11,14 +11,15 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
@@ -33,9 +34,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
@@ -52,7 +53,6 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.ridenbmscontroller.model.AppState
-import com.example.ridenbmscontroller.model.PowerDirection
 import com.example.ridenbmscontroller.ui.formatRidenTempF
 import com.example.ridenbmscontroller.ui.ridenInternalTempColor
 import com.example.ridenbmscontroller.ui.theme.BatteryGreen
@@ -67,14 +67,13 @@ import com.example.ridenbmscontroller.ui.theme.WarningOrange
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.sin
-import androidx.compose.foundation.layout.offset
-
 
 @Composable
 fun DashboardScreen(
     state: AppState,
     modifier: Modifier = Modifier,
     onSilenceLowSocAlarm: () -> Unit = {},
+    onSilenceSocDriftAlarm: () -> Unit = {},
     onSetActiveKnee: (Double) -> Unit = {}
 ) {
     Column(
@@ -82,10 +81,10 @@ fun DashboardScreen(
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
             .verticalScroll(rememberScrollState())
-            .padding(14.dp),
+            .padding(start = 14.dp, end = 14.dp, bottom = 14.dp, top = 0.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        BatteryGaugeCard(state, onSilenceLowSocAlarm)
+        BatteryGaugeCard(state, onSilenceLowSocAlarm, onSilenceSocDriftAlarm)
         RidenPanel(state, onSetActiveKnee)
         HealthPanel(state)
         ControllerPanel(state)
@@ -93,20 +92,30 @@ fun DashboardScreen(
 }
 
 @Composable
-private fun BatteryGaugeCard(state: AppState, onSilenceLowSocAlarm: () -> Unit) {
+private fun BatteryGaugeCard(
+    state: AppState,
+    onSilenceLowSocAlarm: () -> Unit,
+    onSilenceSocDriftAlarm: () -> Unit
+) {
     Surface(
         color = Panel,
         shape = RoundedCornerShape(8.dp),
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier
+            .fillMaxWidth()
+            .offset(y = (-6).dp)
     ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.padding(14.dp)
+            modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 14.dp, top = 0.dp)
         ) {
             HalfCircleSocGauge(state)
             if (state.alerts.lowSocAlarmActive) {
                 Spacer(Modifier.height(8.dp))
                 LowSocAlertRow(state, onSilenceLowSocAlarm)
+            }
+            if (state.alerts.socDriftAlarmActive) {
+                Spacer(Modifier.height(8.dp))
+                SocDriftAlertRow(state, onSilenceSocDriftAlarm)
             }
             Spacer(Modifier.height(10.dp))
             Row(
@@ -125,50 +134,29 @@ private fun BatteryGaugeCard(state: AppState, onSilenceLowSocAlarm: () -> Unit) 
 @Composable
 private fun HalfCircleSocGauge(state: AppState) {
     val soc = state.battery.socPercent.coerceIn(0, 100)
+    val worstCaseSoc = state.battery.worstCaseSocPercent
     val lowSocActive = state.alerts.lowSocAlarmActive
-    val gaugeColor = if (lowSocActive) WarningOrange else BatteryGreen
+    val driftAlarmActive = state.alerts.socDriftAlarmActive
+    val gaugeColor = when {
+        lowSocActive || driftAlarmActive -> WarningOrange
+        else -> BatteryGreen
+    }
     val deviceIssueText = deviceIssueText(state)
-    val chargeText = deviceIssueText ?: when (state.battery.direction) {
-        PowerDirection.Charging -> "CHARGING"
-        PowerDirection.Discharging -> "DISCHARGING"
-        PowerDirection.Idle -> "IDLE"
-    }
-    val chargeColor = if (deviceIssueText != null) {
-        DeviceRed
-    } else {
-        when (state.battery.direction) {
-            PowerDirection.Charging -> if (lowSocActive) WarningOrange else BatteryGreen
-            PowerDirection.Discharging -> VoltageAmber
-            PowerDirection.Idle -> TextMuted
-        }
-    }
     val capacityText = formatAmpHourProgress(state.battery.remainingAh, state.battery.nominalAh)
 
     Box(
         contentAlignment = Alignment.Center,
         modifier = Modifier
             .fillMaxWidth()
-            .height(188.dp)
+            .height(168.dp)
     ) {
-        if (state.batteryTimeEstimateText.isNotBlank()) {
-            Text(
-                text = state.batteryTimeEstimateText,
-                color = TextMuted,
-                fontSize = 16.sp,
-                fontWeight = FontWeight.SemiBold,
-                textAlign = TextAlign.End,
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .offset(y = (-14).dp)
-            )
-        }
         Canvas(Modifier.fillMaxSize()) {
             val stroke = 24.dp.toPx()
             val width = size.width
             val gaugeWidth = width * 0.86f
             val arcHeight = gaugeWidth * 0.50f
             val left = (width - gaugeWidth) / 2f
-            val top = 28.dp.toPx()
+            val top = 5.dp.toPx()
             val rect = Rect(left, top, left + gaugeWidth, top + arcHeight * 2f)
             val arcRadius = rect.width / 2f
             val capAngle = Math.toDegrees((stroke / 2f / arcRadius).toDouble()).toFloat()
@@ -218,20 +206,40 @@ private fun HalfCircleSocGauge(state: AppState) {
 
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.padding(top = 58.dp)
+            modifier = Modifier.padding(top = 42.dp)
         ) {
             Text(
                 text = "$soc%",
-                color = if (lowSocActive) WarningOrange else MaterialTheme.colorScheme.onSurface,
+                color = if (lowSocActive || driftAlarmActive) {
+                    WarningOrange
+                } else {
+                    MaterialTheme.colorScheme.onSurface
+                },
                 fontSize = 48.sp,
                 fontWeight = FontWeight.Bold
             )
-            Text(
-                text = chargeText,
-                color = chargeColor,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold
-            )
+            if (worstCaseSoc != null && (worstCaseSoc < soc || state.battery.socDriftAh > 0.01)) {
+                val driftGap = soc - worstCaseSoc
+                val worstCaseColor = when {
+                    driftGap > 20 -> DeviceRed
+                    driftGap > 10 -> WarningOrange
+                    else -> TextMuted
+                }
+                Text(
+                    text = "EST $worstCaseSoc%",
+                    color = worstCaseColor,
+                    fontSize = 28.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            if (deviceIssueText != null) {
+                Text(
+                    text = deviceIssueText,
+                    color = DeviceRed,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
             Text(
                 text = capacityText,
                 color = TextMuted,
@@ -311,6 +319,38 @@ private fun LowSocAlertRow(state: AppState, onSilenceLowSocAlarm: () -> Unit) {
 }
 
 @Composable
+private fun SocDriftAlertRow(state: AppState, onSilenceSocDriftAlarm: () -> Unit) {
+    val worst = state.battery.worstCaseSocPercent ?: state.alerts.socDriftThresholdPercent
+    Surface(
+        color = WarningOrange.copy(alpha = 0.16f),
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(8.dp)
+        ) {
+            Text(
+                text = if (state.alerts.socDriftSilenced) {
+                    "WORST-CASE SOC $worst% - silenced"
+                } else {
+                    "WORST-CASE SOC $worst%"
+                },
+                color = WarningOrange,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f)
+            )
+            if (!state.alerts.socDriftSilenced) {
+                Button(onClick = onSilenceSocDriftAlarm) {
+                    Text("Silence")
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun RidenPanel(state: AppState, onSetActiveKnee: (Double) -> Unit) {
     var targetPvDialogOpen by remember { mutableStateOf(false) }
     fun closeTargetPvDialog() {
@@ -361,6 +401,24 @@ private fun RidenPanel(state: AppState, onSetActiveKnee: (Double) -> Unit) {
                 ValueTile("VIN", "%.2f".format(state.riden.vin), "V", VoltageAmber, Modifier.weight(1f))
                 ValueTile("VOUT", "%.2f".format(state.riden.vout), "V", VoltageAmber, Modifier.weight(1f))
                 ValueTile("IOUT", "%.2f".format(state.riden.iout), "A", CurrentRose, Modifier.weight(1f))
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val chargePhase = chargePhaseTileValue(state)
+                ValueTile(
+                    "Mode",
+                    chargePhase,
+                    "",
+                    chargePhaseColor(chargePhase),
+                    Modifier.weight(1f)
+                )
+                ValueTile(
+                    "Avg Pack A",
+                    state.controller.averagePackCurrentA?.let { "%.2f".format(it) } ?: "—",
+                    "A",
+                    CurrentRose,
+                    Modifier.weight(1f)
+                )
+                ValueTile("Reserved", "—", "", TextMuted, Modifier.weight(1f))
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 val today = state.energy.whToday.formatWattHours()
@@ -467,9 +525,13 @@ private fun SolarSplitHeader(state: AppState) {
             Text(
                 buildAnnotatedString {
                     withStyle(SpanStyle(color = TextMuted)) { append("Batt ") }
-                    withStyle(SpanStyle(color = if (solarActive) BatteryGreen else TextMuted)) { append(batteryWatts.formatWholeWatts()) }
+                    withStyle(SpanStyle(color = if (solarActive) BatteryGreen else TextMuted)) {
+                        append(batteryWatts.formatWholeWatts())
+                    }
                     withStyle(SpanStyle(color = TextMuted)) { append("  Load ") }
-                    withStyle(SpanStyle(color = if (solarActive) VoltageAmber else TextMuted)) { append(loadWatts.formatWholeWatts()) }
+                    withStyle(SpanStyle(color = if (solarActive) VoltageAmber else TextMuted)) {
+                        append(loadWatts.formatWholeWatts())
+                    }
                 },
                 color = TextMuted,
                 fontSize = 12.sp,
@@ -702,6 +764,29 @@ private fun modeColor(mode: String): Color {
         "SOC Hold", "Tracking" -> BatteryGreen
         "Balance" -> WarningOrange
         "Voltage Limit" -> VoltageAmber
+        "BMS V Hold" -> PowerBlue
+        else -> TextMuted
+    }
+}
+
+/** Compact charge-phase label for the solar tile row: BULK / SOCH / PVH. */
+private fun chargePhaseTileValue(state: AppState): String {
+    if (!state.controller.enabled) return "—"
+    if (state.controller.pvMode == "BMS V Hold" || state.controller.controlBand == "VH") {
+        return "PVH"
+    }
+    return when (state.controller.pvMode) {
+        "SOC Hold", "Voltage Limit" -> "SOCH"
+        "Idle", "Alarm" -> "—"
+        else -> "BULK"
+    }
+}
+
+private fun chargePhaseColor(phase: String): Color {
+    return when (phase) {
+        "BULK" -> BatteryGreen
+        "SOCH" -> VoltageAmber
+        "PVH" -> PowerBlue
         else -> TextMuted
     }
 }

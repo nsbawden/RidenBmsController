@@ -24,7 +24,10 @@ data class BatteryState(
     val direction: PowerDirection,
     val chargeMode: ChargeMode,
     val balancing: Boolean,
-    val cellDeltaMv: Int
+    val cellDeltaMv: Int,
+    /** Worst-case SOC after deadband coulomb uncertainty; null if capacity unknown. */
+    val worstCaseSocPercent: Int? = null,
+    val socDriftAh: Double = 0.0
 )
 
 data class RidenState(
@@ -68,7 +71,9 @@ data class ControllerState(
     val bmsConnected: Boolean,
     val recoveryActive: Boolean,
     val socTargetPercent: Int,
-    val effectiveKneeDelaySeconds: Double = 30.0
+    val effectiveKneeDelaySeconds: Double = 30.0,
+    /** 60 s rolling average of BMS pack current (A), used by BMS voltage-hold end-current. */
+    val averagePackCurrentA: Double? = null
 )
 
 data class AlertState(
@@ -77,7 +82,10 @@ data class AlertState(
     val lowSocSilenced: Boolean,
     val lowSocThresholdPercent: Int,
     val ridenOtpAlarmActive: Boolean = false,
-    val ridenOtpTempF: Double? = null
+    val ridenOtpTempF: Double? = null,
+    val socDriftAlarmActive: Boolean = false,
+    val socDriftSilenced: Boolean = false,
+    val socDriftThresholdPercent: Int = 20
 )
 
 data class AppSettings(
@@ -92,6 +100,31 @@ data class AppSettings(
     val socHoldCurrentAmps: Double,
     val bmsCurrentDeadbandAmps: Double,
     val lowSocAlarmPercent: Int,
+    /** Hardware BMS near-zero current deadband used for worst-case SOC drift (A). */
+    val socDriftDeadbandAmps: Double,
+    /** Alarm when estimated worst-case SOC falls to this percent or below. */
+    val socDriftAlarmPercent: Int,
+    /** Max net battery charge current while soaking at 100% SOC top-off (A). Riden may exceed this to cover loads. */
+    val topOffMaxChargeAmps: Double,
+    /**
+     * Experimental: after SOC ceiling, regulate BMS pack voltage (VSET unchanged) until
+     * end-current EST sync, then [holdWithPackVoltage] selects sustained hold method.
+     * Re-arms when SOC drops below the ceiling.
+     */
+    val bmsVoltageHoldEnabled: Boolean,
+    /** BMS pack voltage setpoint for pack-voltage hold / absorb (V). */
+    val bmsVoltageHoldVolts: Double,
+    /**
+     * Experimental: during post-SOC absorb, after pack has been within 0.1 V of
+     * [bmsVoltageHoldVolts] with average charge current above this value, EST resets to BMS
+     * SOC when average current falls to it.
+     */
+    val bmsVoltageHoldEndCurrentAmps: Double,
+    /**
+     * When true, SOC-ceiling hold uses pack-voltage regulation (PVH). When false, uses
+     * normal SOC-hold trickle (SOCH). Also keeps PVH after experimental EST sync.
+     */
+    val holdWithPackVoltage: Boolean,
     val minTargetPvVolts: Double,
     val maxTargetPvVolts: Double,
     val kneeStepVolts: Double,
@@ -135,8 +168,7 @@ data class AppState(
     val history: List<HistoryPoint>,
     val events: List<String>,
     val logs: List<String>,
-    val opsLogSummary: OpsLogStorageSummary,
-    val batteryTimeEstimateText: String
+    val opsLogSummary: OpsLogStorageSummary
 ) {
     companion object {
         val preview = AppState(
@@ -208,6 +240,13 @@ data class AppState(
                 socHoldCurrentAmps = 0.5,
                 bmsCurrentDeadbandAmps = 1.0,
                 lowSocAlarmPercent = 20,
+                socDriftDeadbandAmps = 1.5,
+                socDriftAlarmPercent = 20,
+                topOffMaxChargeAmps = 8.0,
+                bmsVoltageHoldEnabled = false,
+                bmsVoltageHoldVolts = 13.60,
+                bmsVoltageHoldEndCurrentAmps = 1.0,
+                holdWithPackVoltage = false,
                 minTargetPvVolts = 30.0,
                 maxTargetPvVolts = 36.0,
                 kneeStepVolts = 0.10,
@@ -232,8 +271,7 @@ data class AppState(
                 totalBytes = 0L,
                 days = emptyList(),
                 logDirectory = ""
-            ),
-            batteryTimeEstimateText = ""
+            )
         )
     }
 }

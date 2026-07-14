@@ -50,6 +50,7 @@ import com.example.ridenbmscontroller.health.CrashLogStore
 import com.example.ridenbmscontroller.health.DailyHealthStore
 import com.example.ridenbmscontroller.health.SkyDisturbanceSnapshot
 import com.example.ridenbmscontroller.health.SkyDisturbanceStore
+import com.example.ridenbmscontroller.health.SocDriftTracker
 import com.example.ridenbmscontroller.logging.OpsLogger
 import com.example.ridenbmscontroller.logging.OpsLogStorageSummary
 import com.example.ridenbmscontroller.logging.OpsTelemetrySample
@@ -74,7 +75,10 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import androidx.compose.foundation.layout.calculateEndPadding
+import androidx.compose.foundation.layout.calculateStartPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.platform.LocalLayoutDirection
 
 class MainActivity : ComponentActivity() {
     private lateinit var bmsBleScanner: BmsBleScanner
@@ -94,8 +98,6 @@ class MainActivity : ComponentActivity() {
     private var historyPoints by mutableStateOf(emptyList<HistoryPoint>())
     private var controllerEvents by mutableStateOf(emptyList<String>())
     private var alertState by mutableStateOf(AppState.preview.alerts)
-    private var batteryTimeEstimateText by mutableStateOf("")
-    private var lastBatteryTimeEstimateMs = 0L
     private var lastControllerEventSignature = ""
     private var lastHistorySampleMs = 0L
     private var lastHistoryPruneMs = 0L
@@ -118,15 +120,20 @@ class MainActivity : ComponentActivity() {
     private lateinit var dailyHealthStore: DailyHealthStore
     private lateinit var skyDisturbanceStore: SkyDisturbanceStore
     private lateinit var crashLogStore: CrashLogStore
+    private lateinit var socDriftTracker: SocDriftTracker
     private var dailyHealth by mutableStateOf(DailyHealthState())
     private var batteryCurrentAverage = RollingAverageWindow(60_000L)
     private var historyAccumulator = HistoryAccumulator()
     private var hadGoodRidenConnection = false
     private var usbAlarmJob: Job? = null
     private var lowSocAlarmJob: Job? = null
+    private var socDriftAlarmJob: Job? = null
     private var ridenOtpAlarmJob: Job? = null
     private var lowSocSilenced = false
+    private var socDriftSilenced = false
     private var ridenOtpDialogDismissed = false
+    private var socDriftAh by mutableStateOf(0.0)
+    private var worstCaseSocPercent by mutableStateOf<Int?>(null)
 
     private val requestBlePermissions = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -153,6 +160,8 @@ class MainActivity : ComponentActivity() {
         crashLogStore = CrashLogStore(this)
         crashLogStore.load(nowDayKey())
         refreshDailyHealth()
+        socDriftTracker = SocDriftTracker(this)
+        socDriftAh = socDriftTracker.driftAh
         historyPoints = loadHistory()
         lastHistorySampleMs = System.currentTimeMillis()
         applyKeepScreenOn(appSettings.keepScreenOn)
@@ -182,16 +191,23 @@ class MainActivity : ComponentActivity() {
                 if (appSettings.logCrashEpisodesEnabled) {
                     crashLogStore.appendSample(sample)
                 }
+            },
+            onTopOffComplete = { reason ->
+                resetSocDriftFromTopOff(reason)
+                cancelBalanceDayAfterTopOff()
+            },
+            onBmsVoltageHoldEstSync = {
+                resetSocDriftFromBmsVoltageHold()
             }
         )
         bmsBleScanner = BmsBleScanner(this) {
             bmsBleState = it
             batteryCurrentAverage.add(System.currentTimeMillis(), it.telemetry.packCurrent)
-            updateBatteryTimeEstimate()
             historyAccumulator.addBms(it)
             updateBmsEnergyFromPower(it.telemetry.packVoltage, it.telemetry.packCurrent)
             maybeRecordHistory()
             maybeRecordOpsTelemetry()
+            updateSocDrift()
             updateLowSocAlarm()
             tickController()
         }
@@ -222,7 +238,9 @@ class MainActivity : ComponentActivity() {
                     alertState = alertState,
                     opsLogSummary = opsLogSummary,
                     logStorageWarning = logStorageWarning,
-                    batteryTimeEstimateText = batteryTimeEstimateText,
+                    worstCaseSocPercent = worstCaseSocPercent,
+                    socDriftAh = socDriftAh,
+                    averagePackCurrentA = batteryCurrentAverage.average(System.currentTimeMillis()),
                     onSettingsChanged = {
                         val previous = appSettings
                         if (it != previous) {
@@ -239,6 +257,7 @@ class MainActivity : ComponentActivity() {
                             }
                             applyKeepScreenOn(it.keepScreenOn)
                             applyControllerKeepAlive(it.controllerEnabled)
+                            updateSocDrift()
                             updateLowSocAlarm()
                             tickController()
                         }
@@ -254,6 +273,7 @@ class MainActivity : ComponentActivity() {
                     daysUntilNextBalance = daysUntilNextBalance(appSettings),
                     onToggleBalanceToday = { toggleBalanceToday() },
                     onResetEnergyTotal = { resetEnergyTotal() },
+                    onResetSocDrift = { resetSocDriftManual() },
                     onResetLearnedKnee = {
                         mpptController.resetLearnedKnee()
                         tickController()
@@ -269,6 +289,7 @@ class MainActivity : ComponentActivity() {
                         logStorageWarning = null
                     },
                     onSilenceLowSocAlarm = { silenceLowSocAlarm() },
+                    onSilenceSocDriftAlarm = { silenceSocDriftAlarm() },
                     ridenOtpDialogVisible = alertState.ridenOtpAlarmActive && !ridenOtpDialogDismissed,
                     onDismissRidenOtpDialog = { dismissRidenOtpDialog() }
                 )
@@ -306,7 +327,19 @@ class MainActivity : ComponentActivity() {
 
     private fun tickController() {
         if (!::mpptController.isInitialized) return
-        mpptController.tick(appSettings, bmsBleState, ridenUsbState)
+        val telemetry = bmsBleState.telemetry
+        val soc = telemetry.socPercent
+        val estAtFull = ::socDriftTracker.isInitialized &&
+            soc != null &&
+            socDriftTracker.isEstAtFull(soc, telemetry.nominalAh)
+        val averagePackCurrentA = batteryCurrentAverage.average(System.currentTimeMillis())
+        mpptController.tick(
+            appSettings,
+            bmsBleState,
+            ridenUsbState,
+            estAtFull = estAtFull,
+            averagePackCurrentA = averagePackCurrentA
+        )
     }
 
     private fun updateUsbAlarm(connected: Boolean) {
@@ -442,6 +475,98 @@ class MainActivity : ComponentActivity() {
         publishAlerts()
     }
 
+    private fun updateSocDrift() {
+        if (!::socDriftTracker.isInitialized) return
+        val telemetry = bmsBleState.telemetry
+        val resetReason = socDriftTracker.update(
+            nowMs = System.currentTimeMillis(),
+            bmsConnected = bmsBleState.connectedDeviceAddress != null,
+            socPercent = telemetry.socPercent,
+            packCurrentA = telemetry.packCurrent,
+            deadbandAmps = appSettings.socDriftDeadbandAmps
+        )
+        socDriftAh = socDriftTracker.driftAh
+        val soc = telemetry.socPercent
+        worstCaseSocPercent = if (soc != null) {
+            socDriftTracker.worstCaseSocPercent(soc, telemetry.nominalAh)
+        } else {
+            null
+        }
+        if (resetReason != null) {
+            addControllerEvent("SOC drift reset ($resetReason)")
+        }
+        updateSocDriftAlarm()
+    }
+
+    private fun resetSocDriftManual() {
+        if (!::socDriftTracker.isInitialized) return
+        socDriftTracker.reset()
+        socDriftAh = 0.0
+        val soc = bmsBleState.telemetry.socPercent
+        worstCaseSocPercent = if (soc != null) {
+            socDriftTracker.worstCaseSocPercent(soc, bmsBleState.telemetry.nominalAh)
+        } else {
+            null
+        }
+        addControllerEvent("SOC drift reset (manual)")
+        updateSocDriftAlarm()
+    }
+
+    private fun resetSocDriftFromTopOff(reason: String) {
+        if (!::socDriftTracker.isInitialized) return
+        socDriftTracker.reset()
+        socDriftAh = 0.0
+        val soc = bmsBleState.telemetry.socPercent
+        worstCaseSocPercent = if (soc != null) {
+            socDriftTracker.worstCaseSocPercent(soc, bmsBleState.telemetry.nominalAh)
+        } else {
+            null
+        }
+        addControllerEvent("SOC drift reset (top-off: $reason)")
+        updateSocDriftAlarm()
+    }
+
+    private fun resetSocDriftFromBmsVoltageHold() {
+        if (!::socDriftTracker.isInitialized) return
+        socDriftTracker.reset()
+        socDriftAh = 0.0
+        val soc = bmsBleState.telemetry.socPercent
+        worstCaseSocPercent = if (soc != null) {
+            socDriftTracker.worstCaseSocPercent(soc, bmsBleState.telemetry.nominalAh)
+        } else {
+            null
+        }
+        addControllerEvent("SOC drift reset (BMS voltage hold end current)")
+        updateSocDriftAlarm()
+    }
+
+    private fun updateSocDriftAlarm() {
+        val worst = worstCaseSocPercent
+        val active = bmsBleState.connectedDeviceAddress != null &&
+            worst != null &&
+            worst <= appSettings.socDriftAlarmPercent
+
+        if (!active) {
+            if (socDriftAlarmJob != null || socDriftSilenced) {
+                addControllerEvent("SOC drift alarm cleared")
+            }
+            socDriftSilenced = false
+            stopSocDriftAlarm()
+            publishAlerts()
+            return
+        }
+
+        if (!socDriftSilenced) {
+            if (socDriftAlarmJob == null) {
+                addControllerEvent("SOC drift alarm: worst-case $worst%")
+            }
+            startSocDriftAlarmIfNeeded()
+        } else {
+            stopSocDriftAlarm()
+        }
+        publishAlerts()
+    }
+
     private fun startLowSocAlarmIfNeeded() {
         if (lowSocAlarmJob != null) return
         lowSocAlarmJob = lifecycleScope.launch {
@@ -480,25 +605,69 @@ class MainActivity : ComponentActivity() {
         publishAlerts()
     }
 
+    private fun startSocDriftAlarmIfNeeded() {
+        if (socDriftAlarmJob != null) return
+        socDriftAlarmJob = lifecycleScope.launch {
+            val tone = try {
+                ToneGenerator(AudioManager.STREAM_ALARM, 80)
+            } catch (_: Exception) {
+                null
+            }
+            try {
+                while (isActive) {
+                    try {
+                        tone?.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 400)
+                    } catch (_: Exception) {
+                    }
+                    delay(7000)
+                }
+            } finally {
+                try {
+                    tone?.release()
+                } catch (_: Exception) {
+                }
+            }
+        }
+    }
+
+    private fun stopSocDriftAlarm() {
+        socDriftAlarmJob?.cancel()
+        socDriftAlarmJob = null
+    }
+
+    private fun silenceSocDriftAlarm() {
+        if (!alertState.socDriftAlarmActive) return
+        socDriftSilenced = true
+        stopSocDriftAlarm()
+        addControllerEvent("SOC drift alarm silenced")
+        publishAlerts()
+    }
+
     private fun publishAlerts() {
         val soc = bmsBleState.telemetry.socPercent
         val lowSocActive = bmsBleState.connectedDeviceAddress != null &&
             soc != null &&
             soc <= appSettings.lowSocAlarmPercent
+        val worst = worstCaseSocPercent
+        val driftActive = bmsBleState.connectedDeviceAddress != null &&
+            worst != null &&
+            worst <= appSettings.socDriftAlarmPercent
         alertState = AlertState(
             usbAlarmActive = usbAlarmJob != null,
             lowSocAlarmActive = lowSocActive,
             lowSocSilenced = lowSocActive && lowSocSilenced,
             lowSocThresholdPercent = appSettings.lowSocAlarmPercent,
             ridenOtpAlarmActive = ridenOtpAlarmJob != null,
-            ridenOtpTempF = ridenUsbState.telemetry.internalTempF
+            ridenOtpTempF = ridenUsbState.telemetry.internalTempF,
+            socDriftAlarmActive = driftActive,
+            socDriftSilenced = driftActive && socDriftSilenced,
+            socDriftThresholdPercent = appSettings.socDriftAlarmPercent
         )
     }
 
     private fun handleMpptControlState(state: MpptControlState) {
         val previous = mpptControlState
         mpptControlState = state
-        updateBatteryTimeEstimate()
         logControllerTransitions(previous, state)
         updateOpsBurstLogging(state)
         maybeRecordOpsTelemetry()
@@ -647,27 +816,6 @@ class MainActivity : ComponentActivity() {
         controllerEvents = (listOf(event) + controllerEvents).take(MAX_CONTROLLER_EVENTS)
         if (::opsLogger.isInitialized && appSettings.logEventsEnabled) {
             opsLogger.logEvent(now, text)
-        }
-    }
-
-    private fun updateBatteryTimeEstimate() {
-        val now = System.currentTimeMillis()
-        if (now - lastBatteryTimeEstimateMs < BATTERY_TIME_UPDATE_MS) return
-        lastBatteryTimeEstimateMs = now
-        val telemetry = bmsBleState.telemetry
-        val remainingAh = telemetry.remainingAh
-        val nominalAh = telemetry.nominalAh
-        val averageAmps = batteryCurrentAverage.average(now)
-        batteryTimeEstimateText = if (remainingAh == null || nominalAh == null) {
-            ""
-        } else {
-            batteryTimeEstimate(
-                averageAmps = averageAmps,
-                remainingAh = remainingAh,
-                nominalAh = nominalAh,
-                socTargetPercent = mpptControlState.socTargetPercent.takeIf { it > 0 }
-                    ?: appSettings.normalSocCeilingPercent
-            )
         }
     }
 
@@ -890,6 +1038,34 @@ class MainActivity : ComponentActivity() {
                 defaults.bmsCurrentDeadbandAmps.toFloat()
             ).toDouble(),
             lowSocAlarmPercent = prefs.getInt(KEY_LOW_SOC_ALARM_PERCENT, defaults.lowSocAlarmPercent),
+            socDriftDeadbandAmps = prefs.getFloat(
+                KEY_SOC_DRIFT_DEADBAND_A,
+                defaults.socDriftDeadbandAmps.toFloat()
+            ).toDouble().coerceIn(0.0, 5.0),
+            socDriftAlarmPercent = prefs.getInt(
+                KEY_SOC_DRIFT_ALARM_PERCENT,
+                defaults.socDriftAlarmPercent
+            ).coerceIn(0, 100),
+            topOffMaxChargeAmps = prefs.getFloat(
+                KEY_TOP_OFF_MAX_CHARGE_A,
+                defaults.topOffMaxChargeAmps.toFloat()
+            ).toDouble().coerceIn(0.5, 60.0),
+            bmsVoltageHoldEnabled = prefs.getBoolean(
+                KEY_BMS_VOLTAGE_HOLD_ENABLED,
+                defaults.bmsVoltageHoldEnabled
+            ),
+            bmsVoltageHoldVolts = prefs.getFloat(
+                KEY_BMS_VOLTAGE_HOLD_V,
+                defaults.bmsVoltageHoldVolts.toFloat()
+            ).toDouble().coerceIn(12.0, 15.0),
+            bmsVoltageHoldEndCurrentAmps = prefs.getFloat(
+                KEY_BMS_VOLTAGE_HOLD_END_CURRENT_A,
+                defaults.bmsVoltageHoldEndCurrentAmps.toFloat()
+            ).toDouble().coerceIn(0.1, 20.0),
+            holdWithPackVoltage = prefs.getBoolean(
+                KEY_HOLD_WITH_PACK_VOLTAGE,
+                defaults.holdWithPackVoltage
+            ),
             minTargetPvVolts = minTargetPv,
             maxTargetPvVolts = maxTargetPv,
             kneeStepVolts = prefs.getFloat(
@@ -966,6 +1142,13 @@ class MainActivity : ComponentActivity() {
             putFloat(KEY_SOC_HOLD_CURRENT_A, settings.socHoldCurrentAmps.toFloat())
             putFloat(KEY_BMS_CURRENT_DEADBAND_A, settings.bmsCurrentDeadbandAmps.toFloat())
             putInt(KEY_LOW_SOC_ALARM_PERCENT, settings.lowSocAlarmPercent)
+            putFloat(KEY_SOC_DRIFT_DEADBAND_A, settings.socDriftDeadbandAmps.toFloat())
+            putInt(KEY_SOC_DRIFT_ALARM_PERCENT, settings.socDriftAlarmPercent)
+            putFloat(KEY_TOP_OFF_MAX_CHARGE_A, settings.topOffMaxChargeAmps.toFloat())
+            putBoolean(KEY_BMS_VOLTAGE_HOLD_ENABLED, settings.bmsVoltageHoldEnabled)
+            putFloat(KEY_BMS_VOLTAGE_HOLD_V, settings.bmsVoltageHoldVolts.toFloat())
+            putFloat(KEY_BMS_VOLTAGE_HOLD_END_CURRENT_A, settings.bmsVoltageHoldEndCurrentAmps.toFloat())
+            putBoolean(KEY_HOLD_WITH_PACK_VOLTAGE, settings.holdWithPackVoltage)
             putFloat(KEY_MIN_TARGET_PV_V, settings.minTargetPvVolts.toFloat())
             putFloat(KEY_MAX_TARGET_PV_V, settings.maxTargetPvVolts.toFloat())
             putFloat(KEY_KNEE_STEP_V, settings.kneeStepVolts.toFloat())
@@ -997,6 +1180,14 @@ class MainActivity : ComponentActivity() {
         val epochDay = if (wasBalanceDay) today - 1L else today
         markBalanceDayStarted(epochDay)
         addControllerEvent(if (wasBalanceDay) "Balance day canceled" else "Balance day forced")
+        tickController()
+    }
+
+    /** After a completed 100% top-off on balance day, resume the normal SOC ceiling. */
+    private fun cancelBalanceDayAfterTopOff() {
+        if (!isBalanceDayToday(appSettings)) return
+        markBalanceDayStarted(currentEpochDay() - 1L)
+        addControllerEvent("Balance day canceled (top-off complete)")
         tickController()
     }
 
@@ -1298,6 +1489,13 @@ class MainActivity : ComponentActivity() {
         private const val KEY_SOC_HOLD_CURRENT_A = "soc_hold_current_a"
         private const val KEY_BMS_CURRENT_DEADBAND_A = "bms_current_deadband_a"
         private const val KEY_LOW_SOC_ALARM_PERCENT = "low_soc_alarm_percent"
+        private const val KEY_SOC_DRIFT_DEADBAND_A = "soc_drift_deadband_a"
+        private const val KEY_SOC_DRIFT_ALARM_PERCENT = "soc_drift_alarm_percent"
+        private const val KEY_TOP_OFF_MAX_CHARGE_A = "top_off_max_charge_a"
+        private const val KEY_BMS_VOLTAGE_HOLD_ENABLED = "bms_voltage_hold_enabled"
+        private const val KEY_BMS_VOLTAGE_HOLD_V = "bms_voltage_hold_v"
+        private const val KEY_BMS_VOLTAGE_HOLD_END_CURRENT_A = "bms_voltage_hold_end_current_a"
+        private const val KEY_HOLD_WITH_PACK_VOLTAGE = "hold_with_pack_voltage"
         private const val KEY_KNEE_VARIANCE_V = "knee_variance_v"
         private const val KEY_MIN_TARGET_PV_V = "min_target_pv_v"
         private const val KEY_MAX_TARGET_PV_V = "max_target_pv_v"
@@ -1346,39 +1544,6 @@ class MainActivity : ComponentActivity() {
         private val eventTimeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
     }
 }
-
-private fun batteryTimeEstimate(
-    averageAmps: Double?,
-    remainingAh: Double,
-    nominalAh: Double,
-    socTargetPercent: Int
-): String {
-    if (averageAmps == null || nominalAh <= 0.0 || remainingAh < 0.0) return ""
-    return when {
-        averageAmps > BATTERY_TIME_MIN_AVERAGE_A -> {
-            val targetAh = nominalAh * socTargetPercent.coerceIn(0, 100) / 100.0
-            val ahToTarget = targetAh - remainingAh
-            if (ahToTarget <= 0.0) "" else "${formatDurationHms(ahToTarget / averageAmps)} to full"
-        }
-        averageAmps < -BATTERY_TIME_MIN_AVERAGE_A -> {
-            val hoursToEmpty = remainingAh / -averageAmps
-            "${formatDurationHms(hoursToEmpty)} to empty"
-        }
-        else -> ""
-    }
-}
-
-private fun formatDurationHms(hours: Double): String {
-    if (!hours.isFinite() || hours < 0.0) return "--:--:--"
-    val totalSeconds = (hours * 3600.0).toLong().coerceAtMost(999L * 3600L + 59L * 60L + 59L)
-    val hh = totalSeconds / 3600L
-    val mm = (totalSeconds % 3600L) / 60L
-    val ss = totalSeconds % 60L
-    return "%02d:%02d:%02d".format(hh, mm, ss)
-}
-
-private const val BATTERY_TIME_MIN_AVERAGE_A = 0.05
-private const val BATTERY_TIME_UPDATE_MS = 2_000L
 
 private class RollingAverageWindow(private val windowMs: Long) {
     private val samples = ArrayDeque<Pair<Long, Double>>()
@@ -1516,7 +1681,9 @@ private fun RidenBmsApp(
     alertState: AlertState,
     opsLogSummary: OpsLogStorageSummary,
     logStorageWarning: String?,
-    batteryTimeEstimateText: String,
+    worstCaseSocPercent: Int?,
+    socDriftAh: Double,
+    averagePackCurrentA: Double?,
     onSettingsChanged: (AppSettings) -> Unit,
     onRequestBlePermissions: () -> Unit,
     onStartBmsScan: () -> Unit,
@@ -1527,12 +1694,14 @@ private fun RidenBmsApp(
     daysUntilNextBalance: Int,
     onToggleBalanceToday: () -> Unit,
     onResetEnergyTotal: () -> Unit,
+    onResetSocDrift: () -> Unit,
     onResetLearnedKnee: () -> Unit,
     onSetActiveKnee: (Double) -> Unit,
     onDeleteOpsLogsBeforeDate: (String) -> String,
     onRefreshOpsLogSummary: () -> Unit,
     onDismissLogStorageWarning: () -> Unit,
     onSilenceLowSocAlarm: () -> Unit,
+    onSilenceSocDriftAlarm: () -> Unit,
     ridenOtpDialogVisible: Boolean,
     onDismissRidenOtpDialog: () -> Unit
 ) {
@@ -1547,7 +1716,9 @@ private fun RidenBmsApp(
         controllerEvents,
         alertState,
         opsLogSummary,
-        batteryTimeEstimateText
+        worstCaseSocPercent,
+        socDriftAh,
+        averagePackCurrentA
     ) {
         AppState.preview.copy(
             settings = appSettings,
@@ -1556,12 +1727,22 @@ private fun RidenBmsApp(
             history = historyPoints,
             events = controllerEvents,
             alerts = alertState,
-            opsLogSummary = opsLogSummary,
-            batteryTimeEstimateText = batteryTimeEstimateText
+            opsLogSummary = opsLogSummary
         )
             .withBmsTelemetry(bmsBleState)
             .withRidenTelemetry(ridenUsbState)
             .withMpptControl(mpptControlState)
+            .let { base ->
+                base.copy(
+                    battery = base.battery.copy(
+                        worstCaseSocPercent = worstCaseSocPercent,
+                        socDriftAh = socDriftAh
+                    ),
+                    controller = base.controller.copy(
+                        averagePackCurrentA = averagePackCurrentA
+                    )
+                )
+            }
     }
     var selectedTab by rememberSaveable { mutableStateOf(AppTab.Dashboard) }
     val tabStateHolder = rememberSaveableStateHolder()
@@ -1622,12 +1803,21 @@ private fun RidenBmsApp(
     ) { innerPadding ->
         tabStateHolder.SaveableStateProvider(selectedTab.name) {
             when (selectedTab) {
-                AppTab.Dashboard -> DashboardScreen(
-                    state = state,
-                    onSilenceLowSocAlarm = onSilenceLowSocAlarm,
-                    onSetActiveKnee = onSetActiveKnee,
-                    modifier = Modifier.padding(innerPadding)
-                )
+                AppTab.Dashboard -> {
+                    val layoutDirection = LocalLayoutDirection.current
+                    DashboardScreen(
+                        state = state,
+                        onSilenceLowSocAlarm = onSilenceLowSocAlarm,
+                        onSilenceSocDriftAlarm = onSilenceSocDriftAlarm,
+                        onSetActiveKnee = onSetActiveKnee,
+                        // No top inset: pull SOC gauge to the top of the screen.
+                        modifier = Modifier.padding(
+                            start = innerPadding.calculateStartPadding(layoutDirection),
+                            end = innerPadding.calculateEndPadding(layoutDirection),
+                            bottom = innerPadding.calculateBottomPadding()
+                        )
+                    )
+                }
                 AppTab.History -> HistoryScreen(state, Modifier.padding(innerPadding))
                 AppTab.Devices -> DevicesScreen(
                     bleState = bmsBleState,
@@ -1644,11 +1834,14 @@ private fun RidenBmsApp(
                     settings = state.settings,
                     riden = state.riden,
                     energy = state.energy,
+                    socDriftAh = state.battery.socDriftAh,
+                    worstCaseSocPercent = state.battery.worstCaseSocPercent,
                     onSettingsChanged = onSettingsChanged,
                     balanceDayToday = balanceDayToday,
                     daysUntilNextBalance = daysUntilNextBalance,
                     onToggleBalanceToday = onToggleBalanceToday,
                     onResetEnergyTotal = onResetEnergyTotal,
+                    onResetSocDrift = onResetSocDrift,
                     onResetLearnedKnee = onResetLearnedKnee,
                     modifier = Modifier.padding(innerPadding)
                 )

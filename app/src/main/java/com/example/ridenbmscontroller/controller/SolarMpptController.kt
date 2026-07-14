@@ -58,7 +58,9 @@ class SolarMpptController(
     private val onEvent: (String) -> Unit = {},
     private val onCollapseEntered: (scheduled: Boolean, preCrash: SkyDisturbanceSnapshot?) -> Unit = { _, _ -> },
     private val onCrashEpisodeStart: (kind: String, preCrash: SkyDisturbanceSnapshot?, nowMs: Long) -> Int = { _, _, _ -> 0 },
-    private val onCrashLogSample: (CrashLogSample) -> Unit = {}
+    private val onCrashLogSample: (CrashLogSample) -> Unit = {},
+    private val onTopOffComplete: (reason: String) -> Unit = {},
+    private val onBmsVoltageHoldEstSync: () -> Unit = {}
 ) {
     private var outputEnabled = false
     private var commandIset = 0.0
@@ -113,8 +115,10 @@ class SolarMpptController(
     private var useFixedAmpHunt = false
     private var lastAppliedHuntStepA = 0.0
     private var lastAppliedControlBand = "--"
-    private var needsRidenTakeover = false
+    private var needsRidenTakeover = true
     private var takeoverAttemptUntilMs = 0L
+    /** After hard-lock timeout with full sun, skip micro sun-probe ladder and start at 2A. */
+    private var coldStartFastAcquire = false
     private var cachedHandoffVin: Double? = null
     private var cachedHandoffIset: Double? = null
     private var cachedHandoffWatts = 0.0
@@ -125,8 +129,22 @@ class SolarMpptController(
     private var sunProbeLadderIndex = 0
     private var sunProbeLastGoodIset = Tuning.MIN_ISET
     private var sunProbeSettleSinceMs = 0L
+    private var sunProbeFastColdStart = false
     private var overnightVinNearVout = false
     private var bmsOfflineActive = false
+    /** Top-off absorb in progress (bulk charge at BMS 100% until EST sync or 30 min continuous charge). */
+    private var topOffAbsorbActive = false
+    /** Latched after a successful top-off until SOC drops below 100%. */
+    private var topOffFinished = false
+    /** Start of current unbroken above-deadband charge streak while absorbing; 0 if broken. */
+    private var continuousChargeStartMs = 0L
+    /** Saw average pack current above end-current while near BMS hold voltage (this SOC visit). */
+    private var bmsVHoldSawAboveEndCurrent = false
+    /**
+     * Absorb finished for the current SOC-at-limit visit (EST synced). Cleared when SOC drops
+     * below the limit so the next rise re-enters BMS voltage hold.
+     */
+    private var bmsVHoldAbsorbDoneThisVisit = false
     private var lastPreCollapseSnapshot: SkyDisturbanceSnapshot? = null
     private var crashLogActive = false
     private var crashLogEpisodeId = 0
@@ -223,7 +241,9 @@ class SolarMpptController(
     fun tick(
         settings: AppSettings,
         bmsState: BmsBleUiState,
-        ridenState: RidenUsbState
+        ridenState: RidenUsbState,
+        estAtFull: Boolean = false,
+        averagePackCurrentA: Double? = null
     ) {
         val now = System.currentTimeMillis()
         val loopMs = settings.controllerLoopMs.toLong()
@@ -238,6 +258,7 @@ class SolarMpptController(
 
         if (!settings.controllerEnabled || !ridenState.connected) {
             bmsOfflineActive = false
+            clearBmsVoltageHoldVisitState()
             idle(settings, ridenState.telemetry, "Controller off")
             return
         }
@@ -265,6 +286,13 @@ class SolarMpptController(
         if (bmsReady) {
             val chargeBlockingAlarms = bms.chargeBlockingAlarmNames
             if (chargeBlockingAlarms.isNotEmpty()) {
+                // During top-off at 100%, cell/pack OV means sure-full: end soak + clear EST,
+                // then still inhibit (Riden off) so the pack can settle before hold resumes.
+                val ovAlarms = bms.cellOrPackOvervoltageAlarmNames
+                val atTopOffSoc = socTarget >= 100 && socPercent != null && socPercent >= 100
+                if (atTopOffSoc && !topOffFinished && ovAlarms.isNotEmpty()) {
+                    completeTopOff(ovAlarms.joinToString())
+                }
                 updateAlarmBackoff(now)
                 inhibitCharging(
                     settings = settings,
@@ -296,10 +324,32 @@ class SolarMpptController(
         val virtualKnee = virtualKnee(settings)
         val voltageLimited = vout >= chargeVoltageLimit - Tuning.VOLTAGE_LIMIT_EPS
         val currentLimit = settings.maxChargeAmps.coerceAtLeast(Tuning.MIN_ISET)
+        val reachedSocTarget = bmsReady && socPercent != null && socPercent >= socTarget
+        updateTopOffAbsorb(
+            settings = settings,
+            socTarget = socTarget,
+            socPercent = socPercent ?: -1,
+            packCurrentA = batteryAmps,
+            estAtFull = estAtFull,
+            now = now
+        )
+        updateBmsVoltageHoldEstSync(
+            settings = settings,
+            bmsReady = bmsReady,
+            reachedSocTarget = reachedSocTarget,
+            topOffAbsorbActive = topOffAbsorbActive,
+            packVoltage = batteryVolts,
+            averagePackCurrentA = averagePackCurrentA
+        )
+        // During top-off absorb, Vmax remains a VSET ceiling only — do not throttle to hold
+        // or treat voltage-limit as SOC-hold. Cap *battery* charge current; Riden ISET may
+        // still rise to cover loads (same load-follow idea as SOC hold).
+        val topOffBatteryNet = settings.topOffMaxChargeAmps.coerceAtLeast(Tuning.MIN_ISET)
         val targetBatteryCurrent = when {
             !bmsReady && voltageLimited -> settings.socHoldCurrentAmps
             !bmsReady -> currentLimit
-            socPercent >= socTarget || voltageLimited -> settings.socHoldCurrentAmps
+            topOffAbsorbActive -> topOffBatteryNet
+            reachedSocTarget || voltageLimited -> settings.socHoldCurrentAmps
             else -> currentLimit
         }
 
@@ -315,32 +365,106 @@ class SolarMpptController(
             )
         }
 
-        val socHoldActive = bmsReady && (socPercent >= socTarget || voltageLimited)
-        val policyLimit = if (socHoldActive && !balanceDay) {
-            // SOC hold targets net BMS amps (socHoldCurrentAmps), not max charger ISET — allow load following.
+        val socHoldActive = bmsReady &&
+            !topOffAbsorbActive &&
+            (reachedSocTarget || voltageLimited)
+        // Pack-voltage hold only after SOC ceiling (bulk/MPPT keeps load-tracking until then).
+        // holdWithPackVoltage or experimental absorb → PVH; else SOCH. Top-off soak still wins.
+        val bmsVoltageHoldActive = bmsReady &&
+            !topOffAbsorbActive &&
+            reachedSocTarget &&
+            (
+                (settings.bmsVoltageHoldEnabled && !bmsVHoldAbsorbDoneThisVisit && !topOffFinished) ||
+                    settings.holdWithPackVoltage
+            )
+        // Load-follow / voltage-hold modes cap battery net (or pack V), not Riden ISET —
+        // allow up to maxChargeAmps.
+        val policyLimit = if ((socHoldActive && !balanceDay) || topOffAbsorbActive || bmsVoltageHoldActive) {
             currentLimit
         } else {
             targetBatteryCurrent.coerceAtMost(currentLimit)
         }
-        val socHoldLoadFollow = socHoldActive && !balanceDay
-        if (needsRidenTakeover) {
+        val socHoldLoadFollow = socHoldActive && !balanceDay && !bmsVoltageHoldActive
+        val topOffLoadFollow = topOffAbsorbActive && batteryAmps != null
+        var holdIsetForTakeover = false
+        if (needsRidenTakeover && !sunReferenceKnown) {
             if (takeoverAttemptUntilMs == 0L) {
                 takeoverAttemptUntilMs = now + Tuning.TAKEOVER_RETRY_MS
+                onEvent("Cold start: attempting Riden hard lock")
             }
-            if (now <= takeoverAttemptUntilMs &&
-                (tryAdoptRidenOperatingPoint(settings, snapVin, snapIset, snapWatts, policyLimit, now) ||
-                    tryAdoptCachedHandoff(settings, policyLimit, now))
+            if (tryAdoptRidenOperatingPoint(settings, snapVin, snapIset, snapWatts, policyLimit, now) ||
+                tryAdoptCachedHandoff(settings, policyLimit, now)
             ) {
                 needsRidenTakeover = false
                 takeoverAttemptUntilMs = 0L
+                coldStartFastAcquire = false
             } else if (now > takeoverAttemptUntilMs) {
                 needsRidenTakeover = false
                 takeoverAttemptUntilMs = 0L
+                val morningLike = vout > 0.0 && snapVin > 0.0 &&
+                    abs(snapVin - vout) <= Tuning.OVERNIGHT_VIN_VOUT_EPS_V
+                coldStartFastAcquire = !morningLike
+                onEvent(
+                    if (coldStartFastAcquire) {
+                        "Cold start: hard lock missed — fast acquire"
+                    } else {
+                        "Cold start: hard lock missed — morning sun probe"
+                    }
+                )
+            } else {
+                // Preserve live Riden ISET; do not drop to 0.01A while waiting for lock.
+                holdIsetForTakeover = true
             }
+        } else if (needsRidenTakeover && sunReferenceKnown) {
+            needsRidenTakeover = false
+            takeoverAttemptUntilMs = 0L
         }
 
         val oldIset = currentIset(riden.iset)
         val nextIset = when {
+            holdIsetForTakeover -> {
+                pvMode = MODE_TRACKING
+                lastAppliedControlBand = "TK"
+                lastAppliedHuntStepA = 0.0
+                (riden.iset ?: Tuning.MIN_ISET).coerceAtLeast(Tuning.MIN_ISET)
+            }
+            topOffLoadFollow -> tickBatteryNetLoadFollow(
+                settings = settings,
+                oldIset = oldIset,
+                packCurrent = batteryAmps!!,
+                ridenIout = riden.iout ?: oldIset,
+                vin = vin,
+                vout = vout,
+                virtualKnee = virtualKnee,
+                currentLimit = currentLimit,
+                targetNetAmps = topOffBatteryNet,
+                modeLabel = if (balanceDay) MODE_BALANCE else MODE_TRACKING,
+                band = "TO",
+                now = now
+            )
+            // Pack-voltage hold must win over recovery/collapse, otherwise finishStuckRecovery
+            // / SOCH paths keep running and Mode stays SOCH.
+            bmsVoltageHoldActive && batteryVolts != null && batteryAmps != null -> {
+                if (recoveryPhase != PHASE_NONE) {
+                    recoveryPhase = PHASE_NONE
+                    recoveryWaitSinceMs = 0L
+                }
+                val iset = tickBmsVoltageHold(
+                    settings = settings,
+                    oldIset = oldIset,
+                    packVoltage = batteryVolts,
+                    packCurrent = batteryAmps,
+                    ridenIout = riden.iout ?: oldIset,
+                    vin = vin,
+                    virtualKnee = virtualKnee,
+                    currentLimit = currentLimit,
+                    now = now
+                )
+                pvMode = MODE_BMS_V_HOLD
+                resetCollapseState()
+                updateStableRecoveryReset(false, settings, vin, virtualKnee, now)
+                iset
+            }
             recoveryPhase != PHASE_NONE -> recover(
                 settings, oldIset, vin, vout, riden.watts ?: 0.0, virtualKnee, policyLimit, socHoldActive, now
             )
@@ -348,21 +472,22 @@ class SolarMpptController(
                 settings, oldIset, policyLimit, vin, now
             )
             else -> {
-                val iset = if (socHoldLoadFollow && batteryAmps != null) {
-                    tickSocHold(
+                val iset = when {
+                    socHoldLoadFollow && batteryAmps != null -> tickBatteryNetLoadFollow(
                         settings = settings,
                         oldIset = oldIset,
                         packCurrent = batteryAmps,
                         ridenIout = riden.iout ?: oldIset,
                         vin = vin,
                         vout = vout,
-                        outputWatts = riden.watts ?: 0.0,
                         virtualKnee = virtualKnee,
                         currentLimit = currentLimit,
+                        targetNetAmps = settings.socHoldCurrentAmps,
+                        modeLabel = MODE_SOC_HOLD,
+                        band = "SH",
                         now = now
                     )
-                } else {
-                    handleSolarTick(
+                    else -> handleSolarTick(
                         settings, oldIset, vin, vout, riden.watts ?: 0.0, virtualKnee, policyLimit, now
                     )
                 }
@@ -372,8 +497,14 @@ class SolarMpptController(
                         resetCollapseState()
                         updateStableRecoveryReset(false, settings, vin, virtualKnee, now)
                     }
-                    bmsReady && (socPercent >= socTarget || voltageLimited) -> {
-                        pvMode = if (balanceDay) MODE_BALANCE else if (socPercent >= socTarget) MODE_SOC_HOLD else MODE_VOLTAGE_LIMIT
+                    bmsReady && (reachedSocTarget || voltageLimited) -> {
+                        pvMode = if (balanceDay) {
+                            MODE_BALANCE
+                        } else if (reachedSocTarget) {
+                            MODE_SOC_HOLD
+                        } else {
+                            MODE_VOLTAGE_LIMIT
+                        }
                         resetCollapseState()
                         updateStableRecoveryReset(false, settings, vin, virtualKnee, now)
                     }
@@ -397,7 +528,15 @@ class SolarMpptController(
         publish(
             settings = settings,
             status = if (bmsReady) {
-                statusFor(balanceDay, socPercent >= socTarget, voltageLimited)
+                statusFor(
+                    balanceDay = balanceDay,
+                    socReached = reachedSocTarget && !topOffAbsorbActive && !bmsVoltageHoldActive,
+                    voltageLimited = voltageLimited && !bmsVoltageHoldActive,
+                    topOffAbsorbActive = topOffAbsorbActive,
+                    bmsVoltageHoldActive = bmsVoltageHoldActive,
+                    holdVolts = settings.bmsVoltageHoldVolts,
+                    now = now
+                )
             } else {
                 statusForBmsOffline(voltageLimited, chargeVoltageLimit)
             },
@@ -435,13 +574,21 @@ class SolarMpptController(
         val virtualKnee = virtualKnee(settings)
         val voltageLimited = vout >= chargeVoltageLimit - Tuning.VOLTAGE_LIMIT_EPS
         val currentLimit = settings.maxChargeAmps.coerceAtLeast(Tuning.MIN_ISET)
+        val reachedSocTarget = bmsReady && socPercent != null && socPercent >= socTarget
+        val topOffActive = topOffAbsorbActive
+        val topOffBatteryNet = settings.topOffMaxChargeAmps.coerceAtLeast(Tuning.MIN_ISET)
         val targetBatteryCurrent = when {
             !bmsReady && voltageLimited -> settings.socHoldCurrentAmps
             !bmsReady -> currentLimit
-            socPercent != null && (socPercent >= socTarget || voltageLimited) -> settings.socHoldCurrentAmps
+            topOffActive -> topOffBatteryNet
+            reachedSocTarget || voltageLimited -> settings.socHoldCurrentAmps
             else -> currentLimit
         }
-        val policyLimit = targetBatteryCurrent.coerceAtMost(currentLimit)
+        val policyLimit = if (topOffActive) {
+            currentLimit
+        } else {
+            targetBatteryCurrent.coerceAtMost(currentLimit)
+        }
         val vinError = vin - virtualKnee
         emitCrashLogTickIfActive(
             settings = settings,
@@ -670,11 +817,146 @@ class SolarMpptController(
         }
 
         if (!sunReferenceKnown) {
-            startSunProbe(policyLimit)
+            val fast = coldStartFastAcquire
+            coldStartFastAcquire = false
+            startSunProbe(policyLimit, fastColdStart = fast)
             return tickSunProbe(settings, oldIset, vin, vout, outputWatts, virtualKnee, policyLimit, now)
         }
 
         return trackSolarKnee(settings, oldIset, vin, vout, outputWatts, virtualKnee, policyLimit, now)
+    }
+
+    /**
+     * Post-SOC absorb EST→SOC sync: only while SOC is at/above the limit and absorb is not done.
+     * Pack within 0.1 V of hold setpoint, average current was above end-current, then falls to it.
+     * Leaving the voltage band does not end the visit; SOC dropping below the limit re-arms.
+     */
+    private fun updateBmsVoltageHoldEstSync(
+        settings: AppSettings,
+        bmsReady: Boolean,
+        reachedSocTarget: Boolean,
+        topOffAbsorbActive: Boolean,
+        packVoltage: Double?,
+        averagePackCurrentA: Double?
+    ) {
+        val packVoltageHoldFeature =
+            settings.bmsVoltageHoldEnabled || settings.holdWithPackVoltage
+        if (!packVoltageHoldFeature || !bmsReady) {
+            clearBmsVoltageHoldVisitState()
+            return
+        }
+        if (!reachedSocTarget || topOffAbsorbActive || topOffFinished) {
+            clearBmsVoltageHoldVisitState()
+            return
+        }
+        if (bmsVHoldAbsorbDoneThisVisit) {
+            return
+        }
+        if (packVoltage == null || averagePackCurrentA == null) {
+            return
+        }
+        val nearHold = abs(packVoltage - settings.bmsVoltageHoldVolts) <= Tuning.BMS_V_HOLD_EST_SYNC_BAND_V
+        if (!nearHold) {
+            return
+        }
+        val endCurrent = settings.bmsVoltageHoldEndCurrentAmps.coerceAtLeast(0.0)
+        if (averagePackCurrentA > endCurrent) {
+            bmsVHoldSawAboveEndCurrent = true
+        }
+        if (bmsVHoldSawAboveEndCurrent && averagePackCurrentA <= endCurrent) {
+            bmsVHoldAbsorbDoneThisVisit = true
+            onEvent(
+                "BMS voltage hold: EST=SOC (avg ${"%.2f".format(averagePackCurrentA)}A <= " +
+                    "${"%.2f".format(endCurrent)}A at ${"%.2f".format(packVoltage)}V)"
+            )
+            onBmsVoltageHoldEstSync()
+        }
+    }
+
+    private fun clearBmsVoltageHoldVisitState() {
+        bmsVHoldSawAboveEndCurrent = false
+        bmsVHoldAbsorbDoneThisVisit = false
+    }
+
+    /**
+     * BMS pack-voltage hold with load follow: raise ISET so solar covers loads (target ~0 net
+     * at/above hold V; gentle charge below), and taper ISET when pack is over the setpoint.
+     * VSET stays at maxBatteryVolts.
+     */
+    private fun tickBmsVoltageHold(
+        settings: AppSettings,
+        oldIset: Double,
+        packVoltage: Double,
+        packCurrent: Double,
+        ridenIout: Double,
+        vin: Double,
+        virtualKnee: Double,
+        currentLimit: Double,
+        now: Long
+    ): Double {
+        pvMode = MODE_BMS_V_HOLD
+        lastAppliedControlBand = "VH"
+        recoveryPhase = PHASE_NONE
+
+        val holdV = settings.bmsVoltageHoldVolts
+        // Below hold voltage: allow a small net charge so voltage can recover after load dumps.
+        // At/above hold voltage: target zero net (float) while still covering loads.
+        val targetNetAmps = if (packVoltage < holdV) {
+            settings.socHoldCurrentAmps.coerceAtLeast(0.0)
+        } else {
+            0.0
+        }
+        var desired = ridenIout + (targetNetAmps - packCurrent)
+        val vErr = (packVoltage - holdV).coerceAtLeast(0.0)
+        if (vErr > 0.0) {
+            desired -= vErr * Tuning.BMS_V_HOLD_GAIN_A_PER_V
+        }
+        desired = clampPolicyIset(desired, currentLimit)
+        val blended = oldIset + Tuning.SOC_HOLD_ISET_BLEND * (desired - oldIset)
+        lastAppliedHuntStepA = abs(blended - oldIset)
+        updateStableRecoveryReset(true, settings, vin, virtualKnee, now)
+        if (!isCollapsed(settings, vin)) {
+            lastWorkingIset = max(lastWorkingIset * 0.8 + blended * 0.2, Tuning.MIN_ISET)
+        }
+        return clampPolicyIset(blended, currentLimit)
+    }
+
+    /**
+     * Regulate net BMS current (+ into battery) while allowing Riden ISET to rise for loads.
+     * Used for SOC hold trickle and 100% top-off soak.
+     */
+    private fun tickBatteryNetLoadFollow(
+        settings: AppSettings,
+        oldIset: Double,
+        packCurrent: Double,
+        ridenIout: Double,
+        vin: Double,
+        vout: Double,
+        virtualKnee: Double,
+        currentLimit: Double,
+        targetNetAmps: Double,
+        modeLabel: String,
+        band: String,
+        now: Long
+    ): Double {
+        pvMode = modeLabel
+        lastAppliedControlBand = band
+        recoveryPhase = PHASE_NONE
+
+        val netError = targetNetAmps - packCurrent
+        if (abs(netError) <= settings.bmsCurrentDeadbandAmps) {
+            lastAppliedHuntStepA = 0.0
+            return clampPolicyIset(oldIset, currentLimit)
+        }
+
+        val desired = clampPolicyIset(ridenIout + netError, currentLimit)
+        val blended = oldIset + Tuning.SOC_HOLD_ISET_BLEND * (desired - oldIset)
+        lastAppliedHuntStepA = abs(blended - oldIset)
+        updateStableRecoveryReset(true, settings, vin, virtualKnee, now)
+        if (!isCollapsed(settings, vin)) {
+            lastWorkingIset = max(lastWorkingIset * 0.8 + blended * 0.2, Tuning.MIN_ISET)
+        }
+        return clampPolicyIset(blended, currentLimit)
     }
 
     /**
@@ -693,25 +975,20 @@ class SolarMpptController(
         currentLimit: Double,
         now: Long
     ): Double {
-        pvMode = MODE_SOC_HOLD
-        lastAppliedControlBand = "SH"
-        recoveryPhase = PHASE_NONE
-
-        val holdNet = settings.socHoldCurrentAmps
-        val netError = holdNet - packCurrent
-        if (abs(netError) <= settings.bmsCurrentDeadbandAmps) {
-            lastAppliedHuntStepA = 0.0
-            return clampPolicyIset(oldIset, currentLimit)
-        }
-
-        val desired = clampPolicyIset(ridenIout + netError, currentLimit)
-        val blended = oldIset + Tuning.SOC_HOLD_ISET_BLEND * (desired - oldIset)
-        lastAppliedHuntStepA = abs(blended - oldIset)
-        updateStableRecoveryReset(true, settings, vin, virtualKnee, now)
-        if (!isCollapsed(settings, vin)) {
-            lastWorkingIset = max(lastWorkingIset * 0.8 + blended * 0.2, Tuning.MIN_ISET)
-        }
-        return clampPolicyIset(blended, currentLimit)
+        return tickBatteryNetLoadFollow(
+            settings = settings,
+            oldIset = oldIset,
+            packCurrent = packCurrent,
+            ridenIout = ridenIout,
+            vin = vin,
+            vout = vout,
+            virtualKnee = virtualKnee,
+            currentLimit = currentLimit,
+            targetNetAmps = settings.socHoldCurrentAmps,
+            modeLabel = MODE_SOC_HOLD,
+            band = "SH",
+            now = now
+        )
     }
 
     private fun updateMorningSunDetection(settings: AppSettings, vin: Double, vout: Double) {
@@ -727,19 +1004,28 @@ class SolarMpptController(
         }
     }
 
-    private fun startSunProbe(policyLimit: Double) {
+    private fun startSunProbe(policyLimit: Double, fastColdStart: Boolean = false) {
         sunProbeActive = true
-        sunProbeLadderIndex = 0
+        sunProbeFastColdStart = fastColdStart
+        sunProbeLadderIndex = if (fastColdStart) Tuning.SUN_PROBE_FAST_START_INDEX else 0
         sunProbeLastGoodIset = Tuning.MIN_ISET
         sunProbeSettleSinceMs = 0L
         pvMode = MODE_SUN_PROBE
-        onEvent("Sun probe started -> ${"%.2f".format(sunProbeLevelForIndex(0, policyLimit))}A")
+        val startA = sunProbeLevelForIndex(sunProbeLadderIndex, policyLimit)
+        onEvent(
+            if (fastColdStart) {
+                "Cold start hard-lock probe -> ${"%.2f".format(startA)}A"
+            } else {
+                "Sun probe started -> ${"%.2f".format(startA)}A"
+            }
+        )
     }
 
     private fun completeSunProbe(lastGood: Double, reason: String) {
         sunReferenceIset = quantAmps(lastGood.coerceAtLeast(Tuning.MIN_ISET))
         sunReferenceKnown = true
         sunProbeActive = false
+        sunProbeFastColdStart = false
         pvMode = MODE_TRACKING
         onEvent("Sun probe done: Iref ${"%.2f".format(sunReferenceIset)}A ($reason)")
     }
@@ -759,6 +1045,11 @@ class SolarMpptController(
         lastAppliedHuntStepA = 0.0
 
         if (isCollapsed(settings, vin)) {
+            if (sunProbeFastColdStart) {
+                onEvent("Cold start hard-lock collapsed — falling back to morning sun probe")
+                startSunProbe(policyLimit, fastColdStart = false)
+                return sunProbeLevelForIndex(0, policyLimit)
+            }
             completeSunProbe(sunProbeLastGoodIset.coerceAtLeast(Tuning.MIN_ISET), "collapse at ${"%.2f".format(oldIset)}A")
             val startIset = clampPolicyIset(sunReferenceIset, policyLimit)
             return trackSolarKnee(settings, startIset, vin, vout, outputWatts, virtualKnee, policyLimit, now)
@@ -771,10 +1062,15 @@ class SolarMpptController(
             return target
         }
 
+        val settleMs = if (sunProbeFastColdStart) {
+            Tuning.SUN_PROBE_FAST_SETTLE_MS
+        } else {
+            Tuning.SUN_PROBE_SETTLE_MS
+        }
         if (sunProbeSettleSinceMs == 0L) {
             sunProbeSettleSinceMs = now
         }
-        if (now - sunProbeSettleSinceMs < Tuning.SUN_PROBE_SETTLE_MS) {
+        if (now - sunProbeSettleSinceMs < settleMs) {
             return target
         }
 
@@ -916,6 +1212,7 @@ class SolarMpptController(
         sunProbeLadderIndex = 0
         sunProbeLastGoodIset = Tuning.MIN_ISET
         sunProbeSettleSinceMs = 0L
+        sunProbeFastColdStart = false
     }
 
     private fun setSunReferenceFromCrash(
@@ -1589,15 +1886,103 @@ class SolarMpptController(
         return repeatedCollapseWindowMs(settings)
     }
 
-    private fun statusFor(balanceDay: Boolean, socReached: Boolean, voltageLimited: Boolean): String {
+    private fun statusFor(
+        balanceDay: Boolean,
+        socReached: Boolean,
+        voltageLimited: Boolean,
+        topOffAbsorbActive: Boolean = false,
+        bmsVoltageHoldActive: Boolean = false,
+        holdVolts: Double = 0.0,
+        now: Long = 0L
+    ): String {
         return when {
             pvMode == MODE_RECOVER -> "Solar recovery: $recoveryPhase"
             pvMode == MODE_SUN_PROBE -> "Sun capability probe"
+            topOffAbsorbActive -> {
+                if (continuousChargeStartMs > 0L) {
+                    val remainingMs = (Tuning.TOP_OFF_CONTINUOUS_CHARGE_MS - (now - continuousChargeStartMs))
+                        .coerceAtLeast(0L)
+                    val remainingMin = ((remainingMs + 59_999L) / 60_000L).coerceAtLeast(1L)
+                    if (balanceDay) {
+                        "Balance top-off: ${remainingMin}m charge left"
+                    } else {
+                        "Top-off: ${remainingMin}m charge left"
+                    }
+                } else if (balanceDay) {
+                    "Balance top-off: waiting for charge / EST"
+                } else {
+                    "Top-off: waiting for charge / EST"
+                }
+            }
+            bmsVoltageHoldActive -> "BMS voltage hold ${"%.2f".format(holdVolts)}V"
             balanceDay -> "Balance day: SOC target 100%"
             socReached -> "SOC ceiling reached: load support"
             voltageLimited -> "Controller voltage limit"
             else -> "Tracking solar knee" + if (scheduledDrillActive || kneeProbeFast) " (drill down)" else ""
         }
+    }
+
+    /**
+     * Top-off at BMS 100% (SOC target 100%): keep bulk charging until EST reaches 100%,
+     * 30 minutes of continuous above-deadband charge, or cell/pack overvoltage. Then clear
+     * EST and enter normal SOC hold (OV path still inhibits output until the alarm settles).
+     * Vmax remains a VSET ceiling only during absorb.
+     */
+    private fun updateTopOffAbsorb(
+        settings: AppSettings,
+        socTarget: Int,
+        socPercent: Int,
+        packCurrentA: Double?,
+        estAtFull: Boolean,
+        now: Long
+    ) {
+        val wantTopOff = socTarget >= 100 && socPercent >= 100
+        if (!wantTopOff) {
+            if (topOffAbsorbActive) {
+                onEvent("Top-off ended (left 100% SOC)")
+            }
+            topOffAbsorbActive = false
+            topOffFinished = false
+            continuousChargeStartMs = 0L
+            return
+        }
+
+        if (topOffFinished) {
+            topOffAbsorbActive = false
+            continuousChargeStartMs = 0L
+            return
+        }
+
+        if (!topOffAbsorbActive) {
+            topOffAbsorbActive = true
+            continuousChargeStartMs = 0L
+            onEvent("Top-off started (EST 100%, 30 min charge, or OV)")
+        }
+
+        if (estAtFull) {
+            completeTopOff("EST 100%")
+            return
+        }
+
+        val deadband = settings.socDriftDeadbandAmps.coerceAtLeast(0.0)
+        val charging = packCurrentA != null && packCurrentA > deadband
+        if (charging) {
+            if (continuousChargeStartMs == 0L) {
+                continuousChargeStartMs = now
+            } else if (now - continuousChargeStartMs >= Tuning.TOP_OFF_CONTINUOUS_CHARGE_MS) {
+                completeTopOff("30 min continuous charge")
+            }
+        } else {
+            continuousChargeStartMs = 0L
+        }
+    }
+
+    private fun completeTopOff(reason: String) {
+        topOffAbsorbActive = false
+        topOffFinished = true
+        continuousChargeStartMs = 0L
+        onEvent("Top-off complete ($reason): entering SOC hold")
+        onTopOffComplete(reason)
     }
 
     private fun statusForBmsOffline(voltageLimited: Boolean, chargeVoltageLimit: Double): String {
@@ -1797,6 +2182,7 @@ class SolarMpptController(
         private const val MODE_RECOVER = "Recover"
         private const val MODE_SUN_PROBE = "Sun Probe"
         private const val MODE_SOC_HOLD = "SOC Hold"
+        private const val MODE_BMS_V_HOLD = "BMS V Hold"
         private const val MODE_BALANCE = "Balance"
         private const val MODE_VOLTAGE_LIMIT = "Voltage Limit"
         private const val MODE_ALARM = "Alarm"
@@ -1866,8 +2252,18 @@ private object Tuning {
     const val SUN_PROBE_LADDER_3 = 2.00
     const val SUN_PROBE_RAMP_A = 2.00
     const val SUN_PROBE_SETTLE_MS = 400L
+    /** Cold-start hard-lock probe starts at ladder index 3 (2 A) instead of 0.01 A. */
+    const val SUN_PROBE_FAST_START_INDEX = 3
+    const val SUN_PROBE_FAST_SETTLE_MS = 200L
     const val SUN_PROBE_MIN_POUT_W = 5.0
     const val SOC_HOLD_ISET_BLEND = 0.35
+    /** Amps of ISET reduction per volt of BMS pack voltage above hold setpoint. */
+    const val BMS_V_HOLD_GAIN_A_PER_V = 15.0
+    /** Pack must stay within this band of hold voltage for end-current EST sync. */
+    const val BMS_V_HOLD_EST_SYNC_BAND_V = 0.1
+
+    /** Keep bulk charge after BMS reports 100% until EST sync or continuous charge completes. */
+    const val TOP_OFF_CONTINUOUS_CHARGE_MS = 30L * 60L * 1000L
 
     const val MORNING_MIN_IREF_A = 0.01
     const val OVERNIGHT_VIN_VOUT_EPS_V = 1.0
@@ -1876,7 +2272,8 @@ private object Tuning {
     const val TAKEOVER_MIN_POUT_W = 15.0
     const val TAKEOVER_ISET_SLACK_A = 0.5
     const val CURRENT_LIMIT_EPS_A = 0.05
-    const val TAKEOVER_RETRY_MS = 5_000L
+    /** Wait for live Riden telemetry after app restart / USB reconnect before giving up hard lock. */
+    const val TAKEOVER_RETRY_MS = 10_000L
 
     const val COLLAPSE_FLOOR_EXTRA_MARGIN_V = 2.0
 

@@ -77,6 +77,12 @@ data class BmsDecodedTelemetry(
             .filter { it.blocksCharging }
             .map { it.name }
 
+    /** Cell overvoltage (bit 0) or pack overvoltage (bit 2) — used as top-off complete. */
+    val cellOrPackOvervoltageAlarmNames: List<String>
+        get() = decodeProtectionAlarms(protectionStatus)
+            .filter { it.bit == 0 || it.bit == 2 }
+            .map { it.name }
+
     val monitoredChargeBlockingAlarmNames: List<String>
         get() = bmsProtectionAlarms.filter { it.blocksCharging }.map { it.name }
 }
