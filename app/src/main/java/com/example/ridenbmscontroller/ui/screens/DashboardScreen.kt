@@ -102,7 +102,9 @@ private fun BatteryGaugeCard(
         shape = RoundedCornerShape(8.dp),
         modifier = Modifier
             .fillMaxWidth()
-            .offset(y = (-6).dp)
+            // Screen position: keep gauge where 20.dp felt right; in-tile top inset
+            // clears the thick arc stroke, so outer offset is reduced by the same delta.
+            .offset(y = 6.dp)
     ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -124,7 +126,8 @@ private fun BatteryGaugeCard(
             ) {
                 ValueTile("Battery V", "%.2f".format(state.battery.volts), "V", VoltageAmber, Modifier.weight(1f))
                 ValueTile("Battery A", "%.2f".format(state.battery.amps), "A", CurrentRose, Modifier.weight(1f))
-                ValueTile("BMS Watts", "%.0f".format(state.battery.watts), "W", PowerBlue, Modifier.weight(1f))
+                val bmsWatts = formatBmsWatts(state.battery.watts)
+                ValueTile("BMS Watts", bmsWatts.value, bmsWatts.unit, PowerBlue, Modifier.weight(1f))
                 ValueTile("Temp", "%.0f".format(state.battery.temperatureF), "F", WarningOrange, Modifier.weight(1f))
             }
         }
@@ -148,7 +151,7 @@ private fun HalfCircleSocGauge(state: AppState) {
         contentAlignment = Alignment.Center,
         modifier = Modifier
             .fillMaxWidth()
-            .height(168.dp)
+            .height(196.dp)
     ) {
         Canvas(Modifier.fillMaxSize()) {
             val stroke = 24.dp.toPx()
@@ -156,7 +159,8 @@ private fun HalfCircleSocGauge(state: AppState) {
             val gaugeWidth = width * 0.86f
             val arcHeight = gaugeWidth * 0.50f
             val left = (width - gaugeWidth) / 2f
-            val top = 5.dp.toPx()
+            // Enough inset for half of the 24.dp stroke so Surface does not clip the arc top.
+            val top = 19.dp.toPx()
             val rect = Rect(left, top, left + gaugeWidth, top + arcHeight * 2f)
             val arcRadius = rect.width / 2f
             val capAngle = Math.toDegrees((stroke / 2f / arcRadius).toDouble()).toFloat()
@@ -206,7 +210,7 @@ private fun HalfCircleSocGauge(state: AppState) {
 
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.padding(top = 42.dp)
+            modifier = Modifier.padding(top = 56.dp)
         ) {
             Text(
                 text = "$soc%",
@@ -816,6 +820,15 @@ private fun Double.roundAh(): String {
 
 private fun Double.formatWholeWatts(): String {
     return "%.0fW".format(this)
+}
+
+/** Compact BMS pack watts so large discharge values (e.g. -1234) fit the tile. */
+private fun formatBmsWatts(watts: Double): CompactEnergy {
+    return if (watts <= -1000.0) {
+        CompactEnergy("%.1fK".format(watts / 1000.0), "W")
+    } else {
+        CompactEnergy("%.0f".format(watts), "W")
+    }
 }
 
 private fun Double.formatWattHours(): CompactEnergy {
