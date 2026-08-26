@@ -97,6 +97,7 @@ data class AppSettings(
     val targetPvVolts: Double,
     val controllerEnabled: Boolean,
     val normalSocCeilingPercent: Int,
+    /** Net pack trickle (A) once ceiling SOC and [bmsVoltageHoldVolts] are both met. */
     val socHoldCurrentAmps: Double,
     val bmsCurrentDeadbandAmps: Double,
     val lowSocAlarmPercent: Int,
@@ -104,27 +105,12 @@ data class AppSettings(
     val socDriftDeadbandAmps: Double,
     /** Alarm when estimated worst-case SOC falls to this percent or below. */
     val socDriftAlarmPercent: Int,
-    /** Max net battery charge current while soaking at 100% SOC top-off (A). Riden may exceed this to cover loads. */
-    val topOffMaxChargeAmps: Double,
-    /**
-     * Experimental: after SOC ceiling, regulate BMS pack voltage (VSET unchanged) until
-     * end-current EST sync, then [holdWithPackVoltage] selects sustained hold method.
-     * Re-arms when SOC drops below the ceiling.
-     */
-    val bmsVoltageHoldEnabled: Boolean,
-    /** BMS pack voltage setpoint for pack-voltage hold / absorb (V). */
+    /** Pack-voltage hold setpoint used at the normal SOC ceiling (V). */
     val bmsVoltageHoldVolts: Double,
-    /**
-     * Experimental: during post-SOC absorb, after pack has been within 0.1 V of
-     * [bmsVoltageHoldVolts] with average charge current above this value, EST resets to BMS
-     * SOC when average current falls to it.
-     */
-    val bmsVoltageHoldEndCurrentAmps: Double,
-    /**
-     * When true, SOC-ceiling hold uses pack-voltage regulation (PVH). When false, uses
-     * normal SOC-hold trickle (SOCH). Also keeps PVH after experimental EST sync.
-     */
-    val holdWithPackVoltage: Boolean,
+    /** Pack-voltage hold setpoint used at 100% SOC (V). */
+    val fullHoldVolts: Double,
+    /** Net pack trickle (A) once 100% SOC and [fullHoldVolts] are both met. */
+    val fullHoldCurrentAmps: Double,
     val minTargetPvVolts: Double,
     val maxTargetPvVolts: Double,
     val kneeStepVolts: Double,
@@ -168,7 +154,13 @@ data class AppState(
     val history: List<HistoryPoint>,
     val events: List<String>,
     val logs: List<String>,
-    val opsLogSummary: OpsLogStorageSummary
+    val opsLogSummary: OpsLogStorageSummary,
+    /** Phone barometer station pressure in inches of mercury, or null if unavailable. */
+    val barometricPressureInHg: Double? = null,
+    /** GPS altitude lock (meters MSL) used for sea-level correction; null until tapped. */
+    val gpsAltitudeMeters: Double? = null,
+    /** True while a pressure-tile GPS altitude average is in progress. */
+    val gpsAltitudeSampling: Boolean = false
 ) {
     companion object {
         val preview = AppState(
@@ -242,11 +234,9 @@ data class AppState(
                 lowSocAlarmPercent = 20,
                 socDriftDeadbandAmps = 1.5,
                 socDriftAlarmPercent = 20,
-                topOffMaxChargeAmps = 8.0,
-                bmsVoltageHoldEnabled = false,
                 bmsVoltageHoldVolts = 13.60,
-                bmsVoltageHoldEndCurrentAmps = 1.0,
-                holdWithPackVoltage = false,
+                fullHoldVolts = 14.00,
+                fullHoldCurrentAmps = 0.5,
                 minTargetPvVolts = 30.0,
                 maxTargetPvVolts = 36.0,
                 kneeStepVolts = 0.10,

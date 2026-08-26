@@ -1,15 +1,32 @@
 package com.example.ridenbmscontroller
 
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.pm.PackageManager
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.os.Bundle
 import android.media.AudioManager
 import android.media.ToneGenerator
+import android.os.Build
 import android.os.SystemClock
 import android.view.WindowManager
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import androidx.lifecycle.lifecycleScope
+import com.example.ridenbmscontroller.sensors.BarometricPressure
+import kotlin.coroutines.resume
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeout
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Icon
@@ -71,6 +88,7 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 import kotlin.math.abs
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -134,6 +152,34 @@ class MainActivity : ComponentActivity() {
     private var ridenOtpDialogDismissed = false
     private var socDriftAh by mutableStateOf(0.0)
     private var worstCaseSocPercent by mutableStateOf<Int?>(null)
+    private var barometricPressureInHg by mutableStateOf<Double?>(null)
+    private var gpsAltitudeMeters by mutableStateOf<Double?>(null)
+    /** True from cold start until the first altitude sample finishes (or permission blocks it). */
+    private var gpsAltitudeSampling by mutableStateOf(true)
+    private var gpsAltitudeSampleJob: Job? = null
+    private var pendingGpsAltitudeSampleAfterPermission = false
+    private var sensorManager: SensorManager? = null
+    private var pressureSensor: Sensor? = null
+    private var lastPressureUiUpdateElapsedMs = 0L
+    private val pressureListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            if (event.sensor.type != Sensor.TYPE_PRESSURE) return
+            val now = SystemClock.elapsedRealtime()
+            if (barometricPressureInHg != null &&
+                now - lastPressureUiUpdateElapsedMs < PRESSURE_UI_UPDATE_INTERVAL_MS
+            ) {
+                return
+            }
+            lastPressureUiUpdateElapsedMs = now
+            val inHg = event.values[0] * BarometricPressure.HPA_TO_INHG
+            val rounded = (kotlin.math.round(inHg * 100.0) / 100.0)
+            if (barometricPressureInHg != rounded) {
+                barometricPressureInHg = rounded
+            }
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+    }
 
     private val requestBlePermissions = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -141,6 +187,12 @@ class MainActivity : ComponentActivity() {
         bmsBleScanner.refresh()
         if (bmsBleScanner.hasPermissions()) {
             bmsBleScanner.startScan()
+        }
+        if (pendingGpsAltitudeSampleAfterPermission && hasFineLocationPermission()) {
+            startGpsAltitudeSample()
+        } else if (pendingGpsAltitudeSampleAfterPermission) {
+            pendingGpsAltitudeSampleAfterPermission = false
+            gpsAltitudeSampling = false
         }
     }
 
@@ -194,10 +246,9 @@ class MainActivity : ComponentActivity() {
             },
             onTopOffComplete = { reason ->
                 resetSocDriftFromTopOff(reason)
-                cancelBalanceDayAfterTopOff()
-            },
-            onBmsVoltageHoldEstSync = {
-                resetSocDriftFromBmsVoltageHold()
+                if (reason.startsWith("100%")) {
+                    cancelBalanceDayAfterTopOff()
+                }
             }
         )
         bmsBleScanner = BmsBleScanner(this) {
@@ -224,6 +275,8 @@ class MainActivity : ComponentActivity() {
         }
         bmsBleScanner.ensureAutoConnect()
         ridenUsbMonitor.start()
+        sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
+        pressureSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_PRESSURE)
         setContent {
             RidenBmsTheme {
                 RidenBmsApp(
@@ -241,6 +294,10 @@ class MainActivity : ComponentActivity() {
                     worstCaseSocPercent = worstCaseSocPercent,
                     socDriftAh = socDriftAh,
                     averagePackCurrentA = batteryCurrentAverage.average(System.currentTimeMillis()),
+                    barometricPressureInHg = barometricPressureInHg,
+                    gpsAltitudeMeters = gpsAltitudeMeters,
+                    gpsAltitudeSampling = gpsAltitudeSampling,
+                    onPressureTileClick = { startGpsAltitudeSample() },
                     onSettingsChanged = {
                         val previous = appSettings
                         if (it != previous) {
@@ -295,6 +352,7 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+        startGpsAltitudeSample()
     }
 
     private fun updateDailyHealthFromRiden(iout: Double?) {
@@ -327,18 +385,10 @@ class MainActivity : ComponentActivity() {
 
     private fun tickController() {
         if (!::mpptController.isInitialized) return
-        val telemetry = bmsBleState.telemetry
-        val soc = telemetry.socPercent
-        val estAtFull = ::socDriftTracker.isInitialized &&
-            soc != null &&
-            socDriftTracker.isEstAtFull(soc, telemetry.nominalAh)
-        val averagePackCurrentA = batteryCurrentAverage.average(System.currentTimeMillis())
         mpptController.tick(
             appSettings,
             bmsBleState,
-            ridenUsbState,
-            estAtFull = estAtFull,
-            averagePackCurrentA = averagePackCurrentA
+            ridenUsbState
         )
     }
 
@@ -522,21 +572,7 @@ class MainActivity : ComponentActivity() {
         } else {
             null
         }
-        addControllerEvent("SOC drift reset (top-off: $reason)")
-        updateSocDriftAlarm()
-    }
-
-    private fun resetSocDriftFromBmsVoltageHold() {
-        if (!::socDriftTracker.isInitialized) return
-        socDriftTracker.reset()
-        socDriftAh = 0.0
-        val soc = bmsBleState.telemetry.socPercent
-        worstCaseSocPercent = if (soc != null) {
-            socDriftTracker.worstCaseSocPercent(soc, bmsBleState.telemetry.nominalAh)
-        } else {
-            null
-        }
-        addControllerEvent("SOC drift reset (BMS voltage hold end current)")
+        addControllerEvent("SOC drift reset ($reason)")
         updateSocDriftAlarm()
     }
 
@@ -1046,26 +1082,21 @@ class MainActivity : ComponentActivity() {
                 KEY_SOC_DRIFT_ALARM_PERCENT,
                 defaults.socDriftAlarmPercent
             ).coerceIn(0, 100),
-            topOffMaxChargeAmps = prefs.getFloat(
-                KEY_TOP_OFF_MAX_CHARGE_A,
-                defaults.topOffMaxChargeAmps.toFloat()
-            ).toDouble().coerceIn(0.5, 60.0),
-            bmsVoltageHoldEnabled = prefs.getBoolean(
-                KEY_BMS_VOLTAGE_HOLD_ENABLED,
-                defaults.bmsVoltageHoldEnabled
-            ),
             bmsVoltageHoldVolts = prefs.getFloat(
                 KEY_BMS_VOLTAGE_HOLD_V,
                 defaults.bmsVoltageHoldVolts.toFloat()
             ).toDouble().coerceIn(12.0, 15.0),
-            bmsVoltageHoldEndCurrentAmps = prefs.getFloat(
-                KEY_BMS_VOLTAGE_HOLD_END_CURRENT_A,
-                defaults.bmsVoltageHoldEndCurrentAmps.toFloat()
-            ).toDouble().coerceIn(0.1, 20.0),
-            holdWithPackVoltage = prefs.getBoolean(
-                KEY_HOLD_WITH_PACK_VOLTAGE,
-                defaults.holdWithPackVoltage
-            ),
+            fullHoldVolts = prefs.getFloat(
+                KEY_FULL_HOLD_V,
+                defaults.fullHoldVolts.toFloat()
+            ).toDouble().coerceIn(12.0, 15.0),
+            fullHoldCurrentAmps = prefs.getFloat(
+                KEY_FULL_HOLD_CURRENT_A,
+                prefs.getFloat(
+                    KEY_BMS_VOLTAGE_HOLD_END_CURRENT_A,
+                    defaults.fullHoldCurrentAmps.toFloat()
+                )
+            ).toDouble().coerceIn(0.0, 5.0),
             minTargetPvVolts = minTargetPv,
             maxTargetPvVolts = maxTargetPv,
             kneeStepVolts = prefs.getFloat(
@@ -1144,11 +1175,9 @@ class MainActivity : ComponentActivity() {
             putInt(KEY_LOW_SOC_ALARM_PERCENT, settings.lowSocAlarmPercent)
             putFloat(KEY_SOC_DRIFT_DEADBAND_A, settings.socDriftDeadbandAmps.toFloat())
             putInt(KEY_SOC_DRIFT_ALARM_PERCENT, settings.socDriftAlarmPercent)
-            putFloat(KEY_TOP_OFF_MAX_CHARGE_A, settings.topOffMaxChargeAmps.toFloat())
-            putBoolean(KEY_BMS_VOLTAGE_HOLD_ENABLED, settings.bmsVoltageHoldEnabled)
             putFloat(KEY_BMS_VOLTAGE_HOLD_V, settings.bmsVoltageHoldVolts.toFloat())
-            putFloat(KEY_BMS_VOLTAGE_HOLD_END_CURRENT_A, settings.bmsVoltageHoldEndCurrentAmps.toFloat())
-            putBoolean(KEY_HOLD_WITH_PACK_VOLTAGE, settings.holdWithPackVoltage)
+            putFloat(KEY_FULL_HOLD_V, settings.fullHoldVolts.toFloat())
+            putFloat(KEY_FULL_HOLD_CURRENT_A, settings.fullHoldCurrentAmps.toFloat())
             putFloat(KEY_MIN_TARGET_PV_V, settings.minTargetPvVolts.toFloat())
             putFloat(KEY_MAX_TARGET_PV_V, settings.maxTargetPvVolts.toFloat())
             putFloat(KEY_KNEE_STEP_V, settings.kneeStepVolts.toFloat())
@@ -1448,14 +1477,25 @@ class MainActivity : ComponentActivity() {
         if (::bmsBleScanner.isInitialized) {
             bmsBleScanner.ensureAutoConnect()
         }
+        val sensor = pressureSensor
+        val manager = sensorManager
+        if (sensor != null && manager != null) {
+            manager.registerListener(pressureListener, sensor, SensorManager.SENSOR_DELAY_NORMAL)
+        } else {
+            barometricPressureInHg = null
+        }
     }
 
     override fun onPause() {
+        sensorManager?.unregisterListener(pressureListener)
         persistEnergy()
         super.onPause()
     }
 
     override fun onDestroy() {
+        gpsAltitudeSampleJob?.cancel()
+        gpsAltitudeSampleJob = null
+        sensorManager?.unregisterListener(pressureListener)
         stopUsbAlarm()
         stopLowSocAlarm()
         stopRidenOtpAlarm()
@@ -1472,7 +1512,132 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    private fun hasFineLocationPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun startGpsAltitudeSample() {
+        if (gpsAltitudeSampleJob?.isActive == true) return
+        if (!hasFineLocationPermission()) {
+            gpsAltitudeSampling = false
+            pendingGpsAltitudeSampleAfterPermission = true
+            if (::bmsBleScanner.isInitialized) {
+                requestBlePermissions.launch(bmsBleScanner.requiredPermissions())
+            }
+            addControllerEvent("Pressure altitude: location permission needed")
+            return
+        }
+        pendingGpsAltitudeSampleAfterPermission = false
+        gpsAltitudeSampleJob = lifecycleScope.launch {
+            val previousLock = gpsAltitudeMeters
+            gpsAltitudeSampling = true
+            gpsAltitudeMeters = null
+            try {
+                val samples = collectGpsAltitudeSamples(
+                    sampleCount = GPS_ALTITUDE_SAMPLE_COUNT,
+                    minIntervalMs = GPS_ALTITUDE_SAMPLE_INTERVAL_MS,
+                    timeoutMs = GPS_ALTITUDE_SAMPLE_TIMEOUT_MS
+                )
+                if (samples.size >= GPS_ALTITUDE_MIN_GOOD_SAMPLES) {
+                    val averageM = samples.average()
+                    gpsAltitudeMeters = averageM
+                    val feet = averageM * METERS_TO_FEET
+                    addControllerEvent("Pressure altitude locked: %.0f ft".format(feet))
+                } else {
+                    gpsAltitudeMeters = previousLock
+                    addControllerEvent(
+                        if (previousLock != null) {
+                            "Pressure altitude GPS failed; kept previous lock"
+                        } else {
+                            "Pressure altitude GPS failed"
+                        }
+                    )
+                }
+            } catch (e: CancellationException) {
+                gpsAltitudeMeters = previousLock
+                throw e
+            } finally {
+                gpsAltitudeSampling = false
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun collectGpsAltitudeSamples(
+        sampleCount: Int,
+        minIntervalMs: Long,
+        timeoutMs: Long
+    ): List<Double> {
+        val lm = getSystemService(LocationManager::class.java) ?: return emptyList()
+        val provider = when {
+            runCatching { lm.isProviderEnabled(LocationManager.GPS_PROVIDER) }.getOrDefault(false) ->
+                LocationManager.GPS_PROVIDER
+            runCatching { lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) }.getOrDefault(false) ->
+                LocationManager.NETWORK_PROVIDER
+            else -> {
+                addControllerEvent("Pressure altitude: location providers disabled")
+                return emptyList()
+            }
+        }
+        val samples = mutableListOf<Double>()
+        var listener: LocationListener? = null
+        try {
+            withTimeout(timeoutMs) {
+                suspendCancellableCoroutine { cont ->
+                    var lastSampleElapsed = 0L
+                    val locListener = LocationListener { location ->
+                        if (!isAltitudeSampleAcceptable(location)) return@LocationListener
+                        val now = SystemClock.elapsedRealtime()
+                        if (samples.isNotEmpty() && now - lastSampleElapsed < minIntervalMs) {
+                            return@LocationListener
+                        }
+                        lastSampleElapsed = now
+                        samples.add(location.altitude)
+                        if (samples.size >= sampleCount && cont.isActive) {
+                            cont.resume(Unit)
+                        }
+                    }
+                    listener = locListener
+                    try {
+                        lm.requestLocationUpdates(provider, 1000L, 0f, locListener, mainLooper)
+                    } catch (_: SecurityException) {
+                        if (cont.isActive) cont.resume(Unit)
+                        return@suspendCancellableCoroutine
+                    }
+                    cont.invokeOnCancellation {
+                        runCatching { lm.removeUpdates(locListener) }
+                    }
+                }
+            }
+        } catch (_: TimeoutCancellationException) {
+            // Return whatever samples were collected.
+        } finally {
+            listener?.let { runCatching { lm.removeUpdates(it) } }
+        }
+        return samples
+    }
+
+    private fun isAltitudeSampleAcceptable(location: Location): Boolean {
+        if (!location.hasAltitude()) return false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && location.hasVerticalAccuracy()) {
+            if (location.verticalAccuracyMeters > GPS_ALTITUDE_MAX_VERTICAL_ACCURACY_M) {
+                return false
+            }
+        }
+        return true
+    }
+
     companion object {
+        private const val PRESSURE_UI_UPDATE_INTERVAL_MS = 1000L
+        private const val GPS_ALTITUDE_SAMPLE_COUNT = 10
+        private const val GPS_ALTITUDE_MIN_GOOD_SAMPLES = 3
+        private const val GPS_ALTITUDE_SAMPLE_INTERVAL_MS = 2500L
+        private const val GPS_ALTITUDE_SAMPLE_TIMEOUT_MS = 45_000L
+        private const val GPS_ALTITUDE_MAX_VERTICAL_ACCURACY_M = 100f
+        private const val METERS_TO_FEET = 3.280839895
         private const val SETTINGS_PREFS = "controller_settings"
         private const val ENERGY_PREFS = "energy_counters"
         private const val KEY_BALANCE_V = "balance_v"
@@ -1491,11 +1656,10 @@ class MainActivity : ComponentActivity() {
         private const val KEY_LOW_SOC_ALARM_PERCENT = "low_soc_alarm_percent"
         private const val KEY_SOC_DRIFT_DEADBAND_A = "soc_drift_deadband_a"
         private const val KEY_SOC_DRIFT_ALARM_PERCENT = "soc_drift_alarm_percent"
-        private const val KEY_TOP_OFF_MAX_CHARGE_A = "top_off_max_charge_a"
-        private const val KEY_BMS_VOLTAGE_HOLD_ENABLED = "bms_voltage_hold_enabled"
         private const val KEY_BMS_VOLTAGE_HOLD_V = "bms_voltage_hold_v"
+        private const val KEY_FULL_HOLD_V = "full_hold_v"
+        private const val KEY_FULL_HOLD_CURRENT_A = "full_hold_current_a"
         private const val KEY_BMS_VOLTAGE_HOLD_END_CURRENT_A = "bms_voltage_hold_end_current_a"
-        private const val KEY_HOLD_WITH_PACK_VOLTAGE = "hold_with_pack_voltage"
         private const val KEY_KNEE_VARIANCE_V = "knee_variance_v"
         private const val KEY_MIN_TARGET_PV_V = "min_target_pv_v"
         private const val KEY_MAX_TARGET_PV_V = "max_target_pv_v"
@@ -1684,6 +1848,10 @@ private fun RidenBmsApp(
     worstCaseSocPercent: Int?,
     socDriftAh: Double,
     averagePackCurrentA: Double?,
+    barometricPressureInHg: Double?,
+    gpsAltitudeMeters: Double?,
+    gpsAltitudeSampling: Boolean,
+    onPressureTileClick: () -> Unit,
     onSettingsChanged: (AppSettings) -> Unit,
     onRequestBlePermissions: () -> Unit,
     onStartBmsScan: () -> Unit,
@@ -1718,7 +1886,10 @@ private fun RidenBmsApp(
         opsLogSummary,
         worstCaseSocPercent,
         socDriftAh,
-        averagePackCurrentA
+        averagePackCurrentA,
+        barometricPressureInHg,
+        gpsAltitudeMeters,
+        gpsAltitudeSampling
     ) {
         AppState.preview.copy(
             settings = appSettings,
@@ -1727,7 +1898,10 @@ private fun RidenBmsApp(
             history = historyPoints,
             events = controllerEvents,
             alerts = alertState,
-            opsLogSummary = opsLogSummary
+            opsLogSummary = opsLogSummary,
+            barometricPressureInHg = barometricPressureInHg,
+            gpsAltitudeMeters = gpsAltitudeMeters,
+            gpsAltitudeSampling = gpsAltitudeSampling
         )
             .withBmsTelemetry(bmsBleState)
             .withRidenTelemetry(ridenUsbState)
@@ -1810,6 +1984,8 @@ private fun RidenBmsApp(
                         onSilenceLowSocAlarm = onSilenceLowSocAlarm,
                         onSilenceSocDriftAlarm = onSilenceSocDriftAlarm,
                         onSetActiveKnee = onSetActiveKnee,
+                        onPressureTileClick = onPressureTileClick,
+                        onToggleBalanceToday = onToggleBalanceToday,
                         // No top inset: pull SOC gauge to the top of the screen.
                         modifier = Modifier.padding(
                             start = innerPadding.calculateStartPadding(layoutDirection),

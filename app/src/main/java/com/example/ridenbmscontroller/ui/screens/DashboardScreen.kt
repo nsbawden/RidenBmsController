@@ -59,6 +59,7 @@ import com.example.ridenbmscontroller.ui.theme.BatteryGreen
 import com.example.ridenbmscontroller.ui.theme.CurrentRose
 import com.example.ridenbmscontroller.ui.theme.Panel
 import com.example.ridenbmscontroller.ui.theme.PanelAlt
+import com.example.ridenbmscontroller.sensors.BarometricPressure
 import com.example.ridenbmscontroller.ui.theme.PowerBlue
 import com.example.ridenbmscontroller.ui.theme.TextMuted
 import com.example.ridenbmscontroller.ui.theme.TextPrimary
@@ -74,7 +75,9 @@ fun DashboardScreen(
     modifier: Modifier = Modifier,
     onSilenceLowSocAlarm: () -> Unit = {},
     onSilenceSocDriftAlarm: () -> Unit = {},
-    onSetActiveKnee: (Double) -> Unit = {}
+    onSetActiveKnee: (Double) -> Unit = {},
+    onPressureTileClick: () -> Unit = {},
+    onToggleBalanceToday: () -> Unit = {}
 ) {
     Column(
         modifier = modifier
@@ -85,7 +88,7 @@ fun DashboardScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         BatteryGaugeCard(state, onSilenceLowSocAlarm, onSilenceSocDriftAlarm)
-        RidenPanel(state, onSetActiveKnee)
+        RidenPanel(state, onSetActiveKnee, onPressureTileClick, onToggleBalanceToday)
         HealthPanel(state)
         ControllerPanel(state)
     }
@@ -222,20 +225,19 @@ private fun HalfCircleSocGauge(state: AppState) {
                 fontSize = 48.sp,
                 fontWeight = FontWeight.Bold
             )
-            if (worstCaseSoc != null && (worstCaseSoc < soc || state.battery.socDriftAh > 0.01)) {
-                val driftGap = soc - worstCaseSoc
-                val worstCaseColor = when {
-                    driftGap > 20 -> DeviceRed
-                    driftGap > 10 -> WarningOrange
-                    else -> TextMuted
-                }
-                Text(
-                    text = "EST $worstCaseSoc%",
-                    color = worstCaseColor,
-                    fontSize = 28.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
+            val estText = worstCaseSoc?.let { "EST $it%" } ?: "EST --"
+            val estColor = when {
+                worstCaseSoc == null -> TextMuted
+                soc - worstCaseSoc > 20 -> DeviceRed
+                soc - worstCaseSoc > 10 -> WarningOrange
+                else -> TextMuted
             }
+            Text(
+                text = estText,
+                color = estColor,
+                fontSize = 28.sp,
+                fontWeight = FontWeight.SemiBold
+            )
             if (deviceIssueText != null) {
                 Text(
                     text = deviceIssueText,
@@ -355,7 +357,12 @@ private fun SocDriftAlertRow(state: AppState, onSilenceSocDriftAlarm: () -> Unit
 }
 
 @Composable
-private fun RidenPanel(state: AppState, onSetActiveKnee: (Double) -> Unit) {
+private fun RidenPanel(
+    state: AppState,
+    onSetActiveKnee: (Double) -> Unit,
+    onPressureTileClick: () -> Unit,
+    onToggleBalanceToday: () -> Unit
+) {
     var targetPvDialogOpen by remember { mutableStateOf(false) }
     fun closeTargetPvDialog() {
         targetPvDialogOpen = false
@@ -385,7 +392,8 @@ private fun RidenPanel(state: AppState, onSetActiveKnee: (Double) -> Unit) {
                     state.controller.socTargetPercent.toString(),
                     "%",
                     if (state.controller.socTargetPercent >= 100) WarningOrange else BatteryGreen,
-                    Modifier.weight(1f)
+                    Modifier.weight(1f),
+                    onClick = onToggleBalanceToday
                 )
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -422,7 +430,28 @@ private fun RidenPanel(state: AppState, onSetActiveKnee: (Double) -> Unit) {
                     CurrentRose,
                     Modifier.weight(1f)
                 )
-                ValueTile("Reserved", "—", "", TextMuted, Modifier.weight(1f))
+                val altitudeM = state.gpsAltitudeMeters
+                val stationInHg = state.barometricPressureInHg
+                val pressureValue = when {
+                    state.gpsAltitudeSampling -> "…"
+                    stationInHg == null -> "—"
+                    altitudeM != null ->
+                        "%.2f".format(BarometricPressure.seaLevelInHg(stationInHg, altitudeM))
+                    else -> "%.2f".format(stationInHg)
+                }
+                val pressureColor = when {
+                    state.gpsAltitudeSampling -> WarningOrange
+                    altitudeM != null -> TextPrimary
+                    else -> WarningOrange
+                }
+                ValueTile(
+                    "Pressure",
+                    pressureValue,
+                    "inHg",
+                    pressureColor,
+                    Modifier.weight(1f),
+                    onClick = onPressureTileClick
+                )
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 val today = state.energy.whToday.formatWattHours()
@@ -691,12 +720,15 @@ internal fun ValueTile(
     value: String,
     unit: String,
     color: Color,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onClick: (() -> Unit)? = null
 ) {
     Surface(
         color = PanelAlt,
         shape = RoundedCornerShape(8.dp),
-        modifier = modifier.height(66.dp)
+        modifier = modifier
+            .height(66.dp)
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
     ) {
         Column(
             verticalArrangement = Arrangement.Center,

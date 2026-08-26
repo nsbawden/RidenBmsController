@@ -75,32 +75,26 @@ fun SettingsScreen(
             NumberFieldRow("Maximum controller voltage", settings.maxBatteryVolts, "V", 12.0, 15.0) {
                 onSettingsChanged(settings.copy(maxBatteryVolts = it))
             }
+            NumberFieldRow("Ceiling hold voltage", settings.bmsVoltageHoldVolts, "V", 12.0, 15.0) {
+                onSettingsChanged(settings.copy(bmsVoltageHoldVolts = it))
+            }
+            NumberFieldRow("Ceiling hold current", settings.socHoldCurrentAmps, "A", 0.0, 5.0) {
+                onSettingsChanged(settings.copy(socHoldCurrentAmps = it))
+            }
+            NumberFieldRow("100% hold voltage", settings.fullHoldVolts, "V", 12.0, 15.0) {
+                onSettingsChanged(settings.copy(fullHoldVolts = it))
+            }
+            NumberFieldRow("100% hold current", settings.fullHoldCurrentAmps, "A", 0.0, 5.0) {
+                onSettingsChanged(settings.copy(fullHoldCurrentAmps = it))
+            }
             NumberFieldRow("BMS offline max voltage", settings.bmsOfflineMaxBatteryVolts, "V", 12.0, 15.0) {
                 onSettingsChanged(settings.copy(bmsOfflineMaxBatteryVolts = it))
-            }
-            NumberFieldRow("SOC hold current", settings.socHoldCurrentAmps, "A", 0.0, 5.0) {
-                onSettingsChanged(settings.copy(socHoldCurrentAmps = it))
             }
             NumberFieldRow("BMS current deadband", settings.bmsCurrentDeadbandAmps, "A", 0.0, 5.0) {
                 onSettingsChanged(settings.copy(bmsCurrentDeadbandAmps = it))
             }
             IntFieldRow("Low SOC alarm", settings.lowSocAlarmPercent, "%", 0, 100) {
                 onSettingsChanged(settings.copy(lowSocAlarmPercent = it))
-            }
-            NumberFieldRow("Top-off battery current", settings.topOffMaxChargeAmps, "A", 0.5, 60.0) {
-                onSettingsChanged(settings.copy(topOffMaxChargeAmps = it))
-            }
-            ToggleRow("BMS voltage hold (experimental)", settings.bmsVoltageHoldEnabled) {
-                onSettingsChanged(settings.copy(bmsVoltageHoldEnabled = it))
-            }
-            ToggleRow("Hold with pack voltage", settings.holdWithPackVoltage) {
-                onSettingsChanged(settings.copy(holdWithPackVoltage = it))
-            }
-            NumberFieldRow("BMS hold voltage", settings.bmsVoltageHoldVolts, "V", 12.0, 15.0) {
-                onSettingsChanged(settings.copy(bmsVoltageHoldVolts = it))
-            }
-            NumberFieldRow("BMS hold end current", settings.bmsVoltageHoldEndCurrentAmps, "A", 0.1, 20.0) {
-                onSettingsChanged(settings.copy(bmsVoltageHoldEndCurrentAmps = it))
             }
             IntFieldRow("Balance interval", settings.balanceEveryDays, "days", 1, 60) {
                 onSettingsChanged(settings.copy(balanceEveryDays = it))

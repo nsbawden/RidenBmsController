@@ -11,7 +11,7 @@ import kotlin.math.roundToInt
  * - Accumulates driftAh at [deadbandAmps] whenever |I| <= deadband (including at 100% SOC).
  * - At 100% SOC with charge current above the deadband, pays driftAh down by measured charge Ah
  *   (cumulative path toward EST 100%).
- * - Hard-resets on BMS SOC 0, top-off complete, BMS voltage-hold end-current taper, or manual reset.
+ * - Hard-resets on BMS SOC 0, hold complete (SOC + pack voltage gates), or manual reset.
  */
 class SocDriftTracker(context: Context) {
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
